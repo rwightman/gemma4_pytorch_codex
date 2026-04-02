@@ -55,9 +55,9 @@ def factorized_position_embeddings(position_table: torch.Tensor, positions_xy: t
 
 
 def avg_pool_by_positions(
-    x: torch.Tensor,
-    positions_xy: torch.Tensor,
-    length: int,
+        x: torch.Tensor,
+        positions_xy: torch.Tensor,
+        length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, seq_len, _ = x.shape
     k = int((seq_len // length) ** 0.5)
@@ -93,7 +93,10 @@ class Gemma4VisionPatchEmbed(nn.Module):
     def forward(self, patches: torch.Tensor, positions_xy: torch.Tensor) -> torch.Tensor:
         hidden_states = 2.0 * (patches - 0.5)
         hidden_states = self.input_proj(hidden_states)
-        return hidden_states + factorized_position_embeddings(self.position_table, positions_xy).to(hidden_states.dtype)
+        return hidden_states + factorized_position_embeddings(
+            self.position_table,
+            positions_xy,
+        ).to(hidden_states.dtype)
 
 
 class Gemma4VisionMLP(nn.Module):
@@ -125,7 +128,12 @@ class Gemma4VisionAttention(nn.Module):
         self.k_norm = VisionRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
 
-    def forward(self, hidden_states: torch.Tensor, positions_xy: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            positions_xy: torch.Tensor,
+            attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         query = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
         key = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -150,9 +158,21 @@ class Gemma4VisionAttention(nn.Module):
         value = value.transpose(1, 2)
 
         if self.num_key_value_groups > 1:
-            key = key[:, :, None].expand(batch_size, self.num_kv_heads, self.num_key_value_groups, seq_len, self.head_dim)
+            key = key[:, :, None].expand(
+                batch_size,
+                self.num_kv_heads,
+                self.num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
             key = key.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-            value = value[:, :, None].expand(batch_size, self.num_kv_heads, self.num_key_value_groups, seq_len, self.head_dim)
+            value = value[:, :, None].expand(
+                batch_size,
+                self.num_kv_heads,
+                self.num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
             value = value.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
 
         attn_logits = torch.matmul(query, key.transpose(-1, -2))
@@ -173,7 +193,12 @@ class Gemma4VisionBlock(nn.Module):
         self.attn = Gemma4VisionAttention(config)
         self.mlp = Gemma4VisionMLP(config)
 
-    def forward(self, hidden_states: torch.Tensor, positions_xy: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            positions_xy: torch.Tensor,
+            attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
         hidden_states = self.attn(hidden_states, positions_xy, attention_mask)
@@ -194,10 +219,10 @@ class Gemma4VisionPooler(nn.Module):
         self.root_hidden_size = math.sqrt(config.hidden_size)
 
     def _pool_once(
-        self,
-        hidden_states: torch.Tensor,
-        positions_xy: torch.Tensor,
-        output_length: int,
+            self,
+            hidden_states: torch.Tensor,
+            positions_xy: torch.Tensor,
+            output_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if output_length > hidden_states.shape[1]:
             raise ValueError(f"Requested {output_length} soft tokens from {hidden_states.shape[1]} patches.")
@@ -210,10 +235,10 @@ class Gemma4VisionPooler(nn.Module):
         return pooled * self.root_hidden_size, mask
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions_xy: torch.Tensor,
-        output_length_overrides: tuple[int, ...] | None = None,
+            self,
+            hidden_states: torch.Tensor,
+            positions_xy: torch.Tensor,
+            output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         output_lengths = output_length_overrides or self.config.output_length
         if isinstance(output_lengths, int):
@@ -245,10 +270,10 @@ class Gemma4VisionEncoder(nn.Module):
         self.standardize = Gemma4VisionStandardize(config.hidden_size) if config.standardize_embeddings else None
 
     def forward(
-        self,
-        patches_or_images: torch.Tensor,
-        positions_xy: torch.Tensor | None = None,
-        output_length_overrides: tuple[int, ...] | None = None,
+            self,
+            patches_or_images: torch.Tensor,
+            positions_xy: torch.Tensor | None = None,
+            output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         if patches_or_images.ndim >= 4 and patches_or_images.shape[-1] == 3:
             patches, positions_xy = patchify_images(patches_or_images, self.config.patch_size)
@@ -285,18 +310,18 @@ class Gemma4VisionTower(nn.Module):
             self.to_text = init_linear_module(nn.Linear(config.hidden_size, text_hidden_size, bias=False), 1e-2)
 
     def forward(
-        self,
-        patches_or_images: torch.Tensor,
-        positions_xy: torch.Tensor | None = None,
-        output_length_overrides: tuple[int, ...] | None = None,
+            self,
+            patches_or_images: torch.Tensor,
+            positions_xy: torch.Tensor | None = None,
+            output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         return self.encoder(patches_or_images, positions_xy, output_length_overrides)
 
     def encode_to_text(
-        self,
-        patches_or_images: torch.Tensor,
-        positions_xy: torch.Tensor | None = None,
-        output_length_overrides: tuple[int, ...] | None = None,
+            self,
+            patches_or_images: torch.Tensor,
+            positions_xy: torch.Tensor | None = None,
+            output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flatten_groups = False
         if patches_or_images.ndim == 5 or (
@@ -304,7 +329,11 @@ class Gemma4VisionTower(nn.Module):
         ):
             batch, num_images = patches_or_images.shape[:2]
             patches = patches_or_images.view(batch * num_images, *patches_or_images.shape[2:])
-            positions = positions_xy.view(batch * num_images, *positions_xy.shape[2:]) if positions_xy is not None else None
+            positions = (
+                positions_xy.view(batch * num_images, *positions_xy.shape[2:])
+                if positions_xy is not None
+                else None
+            )
             flatten_groups = True
         else:
             batch = patches_or_images.shape[0]

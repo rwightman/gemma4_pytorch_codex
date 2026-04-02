@@ -1,0 +1,41 @@
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project]
+name = "gemma4-pytorch-codex"
+version = "0.1.0"
+description = "Canonical PyTorch implementation of the Gemma 4 model family."
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "torch>=2.1",
+    "sentencepiece",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "jax",
+    "flax",
+]
+
+[tool.pdm.build]
+package-dir = "src"
+includes = ["src/gemma4"]
+source-includes = ["tests"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gemma4"]

@@ -3,7 +3,12 @@ from __future__ import annotations
 import dataclasses
 import enum
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, TypeAlias
+
+
+JsonValue: TypeAlias = (
+    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+)
 
 
 class AttentionKind(str, enum.Enum):
@@ -19,17 +24,17 @@ class KVSharingConfig:
 
 
 def make_attention_layer_types(
-    pattern: tuple[AttentionKind, ...],
-    num_layers: int,
+        pattern: tuple[AttentionKind, ...],
+        num_layers: int,
 ) -> tuple[AttentionKind, ...]:
     repeats, remainder = divmod(num_layers, len(pattern))
     return pattern * repeats + pattern[:remainder]
 
 
 def create_kv_sharing_patterns(
-    kv_sharing: KVSharingConfig | None,
-    num_layers: int,
-    layer_types: tuple[AttentionKind, ...],
+        kv_sharing: KVSharingConfig | None,
+        num_layers: int,
+        layer_types: tuple[AttentionKind, ...],
 ) -> list[int]:
     if kv_sharing is None:
         return list(range(num_layers))
@@ -176,11 +181,11 @@ class Gemma4Config:
     vision: VisionConfig | None = None
     audio: AudioConfig | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, JsonValue]:
         return _to_jsonable(dataclasses.asdict(self))
 
     @classmethod
-    def from_dict(cls, data: dict) -> Gemma4Config:
+    def from_dict(cls, data: dict[str, JsonValue]) -> "Gemma4Config":
         text = TextConfig(
             **_restore_text_config(data["text"]),
         )
@@ -191,7 +196,7 @@ class Gemma4Config:
         return cls(text=text, vision=vision, audio=audio)
 
 
-def _to_jsonable(value):
+def _to_jsonable(value: object) -> JsonValue:
     if dataclasses.is_dataclass(value):
         return _to_jsonable(dataclasses.asdict(value))
     if isinstance(value, enum.Enum):
@@ -205,11 +210,16 @@ def _to_jsonable(value):
     return value
 
 
-def _restore_text_config(data: dict) -> dict:
+def _restore_text_config(data: JsonValue) -> dict[str, object]:
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected a text config mapping, got {type(data).__name__}.")
+
     restored = dict(data)
     restored["layer_types"] = tuple(AttentionKind(v) for v in restored.get("layer_types", ()))
     kv_sharing = restored.get("kv_sharing")
     if kv_sharing is not None:
+        if not isinstance(kv_sharing, dict):
+            raise TypeError("Expected kv_sharing to be a mapping.")
         restored["kv_sharing"] = KVSharingConfig(**kv_sharing)
     return restored
 
@@ -249,6 +259,7 @@ def _default_audio_config() -> AudioConfig:
 
 
 def gemma4_e2b_config(text_only: bool = False) -> Gemma4Config:
+    """Build the Gemma 4 E2B preset."""
     text = TextConfig(
         hidden_size=1_536,
         intermediate_size=4 * 1_536,
@@ -274,6 +285,7 @@ def gemma4_e2b_config(text_only: bool = False) -> Gemma4Config:
 
 
 def gemma4_e4b_config(text_only: bool = False) -> Gemma4Config:
+    """Build the Gemma 4 E4B preset."""
     text = TextConfig(
         hidden_size=2_560,
         intermediate_size=4 * 2_560,
@@ -298,6 +310,7 @@ def gemma4_e4b_config(text_only: bool = False) -> Gemma4Config:
 
 
 def gemma4_31b_config(text_only: bool = False) -> Gemma4Config:
+    """Build the Gemma 4 31B preset."""
     text = TextConfig(
         hidden_size=5_376,
         intermediate_size=4 * 5_376,
@@ -325,6 +338,7 @@ def gemma4_31b_config(text_only: bool = False) -> Gemma4Config:
 
 
 def gemma4_26b_a4b_config(text_only: bool = False) -> Gemma4Config:
+    """Build the Gemma 4 26B-A4B MoE preset."""
     text = TextConfig(
         hidden_size=2_816,
         intermediate_size=2_112,

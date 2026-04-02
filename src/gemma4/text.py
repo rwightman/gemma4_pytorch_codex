@@ -63,11 +63,11 @@ def _make_linear(in_features: int, out_features: int, *, bias: bool, std: float)
 
 
 def _append_to_cache(
-    cache: LayerKVCache | None,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    positions: torch.Tensor,
-    mask: torch.Tensor,
+        cache: LayerKVCache | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        mask: torch.Tensor,
 ) -> LayerKVCache:
     if cache is None:
         return LayerKVCache(key=key, value=value, positions=positions, mask=mask)
@@ -160,8 +160,18 @@ class Gemma4TextAttention(nn.Module):
         self.attn_logits_softcap = config.attn_logits_softcap
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
-        self.q_proj = _make_linear(config.hidden_size, self.num_heads * self.key_dim, bias=False, std=config.init_std)
-        self.k_proj = _make_linear(config.hidden_size, self.num_kv_heads * self.key_dim, bias=False, std=config.init_std)
+        self.q_proj = _make_linear(
+            config.hidden_size,
+            self.num_heads * self.key_dim,
+            bias=False,
+            std=config.init_std,
+        )
+        self.k_proj = _make_linear(
+            config.hidden_size,
+            self.num_kv_heads * self.key_dim,
+            bias=False,
+            std=config.init_std,
+        )
         self.v_proj = None
         if not self.k_eq_v:
             self.v_proj = _make_linear(
@@ -176,13 +186,13 @@ class Gemma4TextAttention(nn.Module):
         self.v_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=False)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        attention_mask: torch.Tensor,
-        query_mask: torch.Tensor,
-        kv_cache: LayerKVCache | None = None,
-        shared_kv: LayerKVCache | None = None,
+            self,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            attention_mask: torch.Tensor,
+            query_mask: torch.Tensor,
+            kv_cache: LayerKVCache | None = None,
+            shared_kv: LayerKVCache | None = None,
     ) -> tuple[torch.Tensor, LayerKVCache]:
         batch_size, seq_len, _ = hidden_states.shape
         query = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.key_dim)
@@ -198,7 +208,11 @@ class Gemma4TextAttention(nn.Module):
 
         if shared_kv is None:
             key = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.key_dim)
-            value = key if self.k_eq_v else self.v_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.key_dim)
+            value = (
+                key
+                if self.k_eq_v
+                else self.v_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.key_dim)
+            )
             key = self.k_norm(key)
             value = self.v_norm(value)
             key = apply_text_rope(
@@ -319,14 +333,14 @@ class Gemma4TextBlock(nn.Module):
         return hidden_states
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        attention_mask: torch.Tensor,
-        query_mask: torch.Tensor,
-        per_layer_input: torch.Tensor | None = None,
-        kv_cache: LayerKVCache | None = None,
-        shared_kv: LayerKVCache | None = None,
+            self,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            attention_mask: torch.Tensor,
+            query_mask: torch.Tensor,
+            per_layer_input: torch.Tensor | None = None,
+            kv_cache: LayerKVCache | None = None,
+            shared_kv: LayerKVCache | None = None,
     ) -> tuple[torch.Tensor, LayerKVCache]:
         residual = hidden_states
         hidden_states = self.pre_attn_norm(hidden_states)
@@ -420,9 +434,9 @@ class Gemma4TextTower(nn.Module):
         return F.linear(hidden_states, self.token_embedding.weight)
 
     def _build_per_layer_inputs(
-        self,
-        input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
+            hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         if not self.config.per_layer_input_dim:
             return None
@@ -442,16 +456,16 @@ class Gemma4TextTower(nn.Module):
         return (model_side + token_side) * (2.0**-0.5)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        inputs_embeds: torch.Tensor | None = None,
-        position_ids: torch.Tensor,
-        query_mask: torch.Tensor | None = None,
-        full_attention_mask: torch.Tensor,
-        sliding_attention_mask: torch.Tensor | None = None,
-        kv_cache: TextKVCache | None = None,
-        return_kv_cache: bool = False,
+            self,
+            input_ids: torch.Tensor,
+            *,
+            inputs_embeds: torch.Tensor | None = None,
+            position_ids: torch.Tensor,
+            query_mask: torch.Tensor | None = None,
+            full_attention_mask: torch.Tensor,
+            sliding_attention_mask: torch.Tensor | None = None,
+            kv_cache: TextKVCache | None = None,
+            return_kv_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, TextKVCache]:
         hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         if query_mask is None:

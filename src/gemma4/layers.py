@@ -54,8 +54,8 @@ def _make_block_mask_indices(bidirectional_mask: torch.Tensor) -> torch.Tensor:
 
 
 def make_causal_bidirectional_mask(
-    input_mask: torch.Tensor,
-    bidirectional_mask: torch.Tensor | None = None,
+        input_mask: torch.Tensor,
+        bidirectional_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     attn_mask = make_causal_mask(input_mask)
     if bidirectional_mask is None:
@@ -69,9 +69,9 @@ def make_causal_bidirectional_mask(
 
 
 def create_sliding_mask(
-    positions: torch.Tensor,
-    sliding_window: int,
-    cache_positions: torch.Tensor | None = None,
+        positions: torch.Tensor,
+        sliding_window: int,
+        cache_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if cache_positions is None:
         cache_positions = positions
@@ -86,15 +86,21 @@ def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     if repeats == 1:
         return hidden_states
     batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, repeats, seq_len, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch,
+        num_kv_heads,
+        repeats,
+        seq_len,
+        head_dim,
+    )
     return hidden_states.reshape(batch, num_kv_heads * repeats, seq_len, head_dim)
 
 
 def merge_flat_embeddings(
-    text_embeddings: torch.Tensor,
-    multimodal_embeddings: torch.Tensor,
-    target_mask: torch.Tensor,
-    multimodal_mask: torch.Tensor | None = None,
+        text_embeddings: torch.Tensor,
+        multimodal_embeddings: torch.Tensor,
+        target_mask: torch.Tensor,
+        multimodal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     merged = text_embeddings.clone()
     if multimodal_mask is None:
@@ -144,11 +150,11 @@ class VisionRMSNorm(RMSNorm):
 
 class ClippedLinear(nn.Linear):
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = False,
-        init_std: float = 1e-2,
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = False,
+            init_std: float = 1e-2,
     ) -> None:
         self.init_std = init_std
         super().__init__(in_features, out_features, bias=bias)
@@ -170,13 +176,13 @@ class ClippedLinear(nn.Linear):
 
 class ScaledEmbedding(nn.Embedding):
     def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int | None = None,
-        *,
-        init_std: float = 1e-2,
-        scale: float | None = None,
+            self,
+            num_embeddings: int,
+            embedding_dim: int,
+            padding_idx: int | None = None,
+            *,
+            init_std: float = 1e-2,
+            scale: float | None = None,
     ) -> None:
         self.init_std = init_std
         self.embed_scale = math.sqrt(embedding_dim) if scale is None else scale
@@ -193,13 +199,13 @@ class ScaledEmbedding(nn.Embedding):
 
 
 def _rope_half_rotation(
-    first_half: torch.Tensor,
-    second_half: torch.Tensor,
-    positions: torch.Tensor,
-    base_theta: float,
-    scale_factor: float,
-    head_dim: int,
-    rotary_half: int,
+        first_half: torch.Tensor,
+        second_half: torch.Tensor,
+        positions: torch.Tensor,
+        base_theta: float,
+        scale_factor: float,
+        head_dim: int,
+        rotary_half: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if rotary_half == 0:
         return first_half, second_half
@@ -230,12 +236,12 @@ def _rope_half_rotation(
 
 
 def apply_text_rope(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    base_theta: float,
-    scale_factor: float = 1.0,
-    rope_proportion: float | None = 1.0,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        base_theta: float,
+        scale_factor: float = 1.0,
+        rope_proportion: float | None = 1.0,
 ) -> torch.Tensor:
     head_dim = x.shape[-1]
     half_dim = head_dim // 2
@@ -255,16 +261,20 @@ def apply_text_rope(
 
 
 def apply_multidim_rope(
-    x: torch.Tensor,
-    positions_xy: torch.Tensor,
-    *,
-    base_theta: float,
-    scale_factor: float = 1.0,
-    rotary_fraction: float | None = None,
+        x: torch.Tensor,
+        positions_xy: torch.Tensor,
+        *,
+        base_theta: float,
+        scale_factor: float = 1.0,
+        rotary_fraction: float | None = None,
 ) -> torch.Tensor:
     ndim = positions_xy.shape[-1]
     num_input_channels = x.shape[-1]
-    num_rotated_channels = num_input_channels if rotary_fraction is None else int(round(num_input_channels * rotary_fraction))
+    num_rotated_channels = (
+        num_input_channels
+        if rotary_fraction is None
+        else int(round(num_input_channels * rotary_fraction))
+    )
     per_dim_channels = 2 * (num_rotated_channels // (2 * ndim))
     if per_dim_channels <= 0:
         raise ValueError(

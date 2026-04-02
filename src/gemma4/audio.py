@@ -111,11 +111,11 @@ class Gemma4AudioLightConv(nn.Module):
 
 
 def _extract_block_context(
-    x: torch.Tensor,
-    block_size: int,
-    left_context: int,
-    right_context: int,
-    padding_value: float = 0.0,
+        x: torch.Tensor,
+        block_size: int,
+        left_context: int,
+        right_context: int,
+        padding_value: float = 0.0,
 ) -> torch.Tensor:
     if left_context < 0 or right_context < 0:
         raise ValueError("Context sizes must be non-negative.")
@@ -210,7 +210,11 @@ class Gemma4AudioLocalAttention(nn.Module):
         self.softcap = 50.0
         self.query_scale = (self.head_dim**-0.5) / math.log(2.0)
         self.key_scale = math.log1p(math.e) / math.log(2.0)
-        self.register_buffer("causal_valid_mask", _causal_valid_mask(config, device=torch.device("cpu")), persistent=False)
+        self.register_buffer(
+            "causal_valid_mask",
+            _causal_valid_mask(config, device=torch.device("cpu")),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
@@ -302,7 +306,10 @@ class Gemma4AudioEncoder(nn.Module):
         self.config = config
         self.subsampler = Gemma4AudioSubsampler(config)
         self.layers = nn.ModuleList([Gemma4AudioConformerLayer(config) for _ in range(config.num_layers)])
-        self.output_proj = init_linear_module(nn.Linear(config.hidden_size, config.output_size, bias=True), config.init_std)
+        self.output_proj = init_linear_module(
+            nn.Linear(config.hidden_size, config.output_size, bias=True),
+            config.init_std,
+        )
 
     def forward(self, features: torch.Tensor, feature_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden, mask = self.subsampler(features, feature_mask)
@@ -326,7 +333,10 @@ class Gemma4AudioTower(nn.Module):
         self.to_text = None
         self.to_text_norm = None
         if text_hidden_size is not None:
-            self.to_text = init_linear_module(nn.Linear(config.output_size, text_hidden_size, bias=False), config.init_std)
+            self.to_text = init_linear_module(
+                nn.Linear(config.output_size, text_hidden_size, bias=False),
+                config.init_std,
+            )
             self.to_text_norm = RMSNorm(text_hidden_size, eps=config.rms_norm_eps, with_scale=False)
 
     def forward(self, features: torch.Tensor, feature_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

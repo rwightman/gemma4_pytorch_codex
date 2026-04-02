@@ -42,21 +42,44 @@ class Gemma4SpecialTokens:
 
 
 class Gemma4Tokenizer:
+    """SentencePiece tokenizer wrapper for Gemma 4."""
+
     def __init__(self, model_file: str | Path) -> None:
         self.model_file = Path(model_file)
-        self.sp_model = spm.SentencePieceProcessor(model_file=str(self.model_file))
+
+        try:
+            self.sp_model = spm.SentencePieceProcessor(model_file=str(self.model_file))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load SentencePiece model from {self.model_file}."
+            ) from exc
+
         self.special_tokens = Gemma4SpecialTokens()
 
     @classmethod
-    def from_pretrained(cls, path: str | Path) -> Gemma4Tokenizer:
+    def from_pretrained(
+            cls,
+            path: str | Path,
+    ) -> "Gemma4Tokenizer":
+        """Load a tokenizer from a model file or model directory.
+
+        Args:
+            path: Tokenizer model file or directory containing tokenizer assets.
+        """
         path = Path(path)
         if path.is_file():
             return cls(path)
 
         config_path = path / TOKENIZER_CONFIG_NAME
         if config_path.exists():
-            with config_path.open() as f:
-                config = json.load(f)
+            try:
+                with config_path.open(encoding="utf-8") as f:
+                    config = json.load(f)
+            except OSError as exc:
+                raise OSError(f"Failed to read tokenizer config from {config_path}.") from exc
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid tokenizer config in {config_path}.") from exc
+
             model_name = config.get("model_file", TOKENIZER_MODEL_NAME)
             model_path = path / model_name
             if model_path.exists():
@@ -75,28 +98,49 @@ class Gemma4Tokenizer:
             return cls(model_files[0])
         raise FileNotFoundError(f"Could not find a SentencePiece tokenizer model in {path}.")
 
-    def save_pretrained(self, save_directory: str | Path) -> None:
+    def save_pretrained(
+            self,
+            save_directory: str | Path,
+    ) -> None:
+        """Save tokenizer assets to a directory.
+
+        Args:
+            save_directory: Destination directory for tokenizer files.
+        """
         save_directory = Path(save_directory)
-        save_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            save_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OSError(f"Failed to create tokenizer directory {save_directory}.") from exc
+
         target = save_directory / TOKENIZER_MODEL_NAME
         if self.model_file.resolve() != target.resolve():
-            shutil.copyfile(self.model_file, target)
-        with (save_directory / TOKENIZER_CONFIG_NAME).open("w") as f:
-            json.dump(
-                {
-                    "tokenizer_class": type(self).__name__,
-                    "model_file": TOKENIZER_MODEL_NAME,
-                },
-                f,
-                indent=2,
-            )
+            try:
+                shutil.copyfile(self.model_file, target)
+            except OSError as exc:
+                raise OSError(f"Failed to copy tokenizer model to {target}.") from exc
+
+        try:
+            with (save_directory / TOKENIZER_CONFIG_NAME).open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "tokenizer_class": type(self).__name__,
+                        "model_file": TOKENIZER_MODEL_NAME,
+                    },
+                    f,
+                    indent=2,
+                )
+        except OSError as exc:
+            raise OSError(
+                f"Failed to write tokenizer config to {save_directory / TOKENIZER_CONFIG_NAME}."
+            ) from exc
 
     def encode(
-        self,
-        text: str,
-        *,
-        add_bos: bool = False,
-        add_eos: bool = False,
+            self,
+            text: str,
+            *,
+            add_bos: bool = False,
+            add_eos: bool = False,
     ) -> list[int]:
         token_ids = list(self.sp_model.encode(text, out_type=int))
         if add_bos and self.bos_token_id is not None:
@@ -106,10 +150,10 @@ class Gemma4Tokenizer:
         return token_ids
 
     def decode(
-        self,
-        token_ids: int | list[int] | torch.Tensor,
-        *,
-        skip_special_tokens: bool = False,
+            self,
+            token_ids: int | list[int] | torch.Tensor,
+            *,
+            skip_special_tokens: bool = False,
     ) -> str:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
@@ -118,28 +162,36 @@ class Gemma4Tokenizer:
 
         if skip_special_tokens:
             special_ids = self.all_special_token_ids
-            token_ids = [int(token_id) for token_id in token_ids if int(token_id) not in special_ids]
+            token_ids = [
+                int(token_id)
+                for token_id in token_ids
+                if int(token_id) not in special_ids
+            ]
         return self.sp_model.decode(token_ids)
 
     def batch_decode(
-        self,
-        batch_token_ids: torch.Tensor | list[list[int]],
-        *,
-        skip_special_tokens: bool = False,
+            self,
+            batch_token_ids: torch.Tensor | list[list[int]],
+            *,
+            skip_special_tokens: bool = False,
     ) -> list[str]:
         if isinstance(batch_token_ids, torch.Tensor):
             batch_token_ids = batch_token_ids.detach().cpu().tolist()
-        return [self.decode(token_ids, skip_special_tokens=skip_special_tokens) for token_ids in batch_token_ids]
+        return [
+            self.decode(token_ids, skip_special_tokens=skip_special_tokens)
+            for token_ids in batch_token_ids
+        ]
 
     def __call__(
-        self,
-        text: str | list[str],
-        *,
-        add_bos: bool = False,
-        add_eos: bool = False,
-        padding: bool | str = False,
-        return_tensors: str | None = None,
+            self,
+            text: str | list[str],
+            *,
+            add_bos: bool = False,
+            add_eos: bool = False,
+            padding: bool | str = False,
+            return_tensors: str | None = None,
     ) -> dict[str, Any]:
+        """Tokenize a string or batch of strings."""
         texts = [text] if isinstance(text, str) else list(text)
         encoded = [self.encode(t, add_bos=add_bos, add_eos=add_eos) for t in texts]
         if padding:

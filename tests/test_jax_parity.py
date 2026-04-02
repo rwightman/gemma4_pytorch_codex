@@ -15,11 +15,11 @@ flax = pytest.importorskip("flax")
 import flax.linen as nn
 from flax.traverse_util import flatten_dict
 
-from gemma4_pytorch_codex.config import AttentionKind, Gemma4Config, TextConfig, VisionConfig
-from gemma4_pytorch_codex.layers import make_causal_mask
-from gemma4_pytorch_codex.model import Gemma4Model
-from gemma4_pytorch_codex.text import Gemma4TextTower
-from gemma4_pytorch_codex.vision import Gemma4VisionEncoder
+from gemma4.config import AttentionKind, Gemma4Config, TextConfig, VisionConfig
+from gemma4.layers import make_causal_mask
+from gemma4.model import Gemma4Model
+from gemma4.text import Gemma4TextTower
+from gemma4.vision import Gemma4VisionEncoder
 
 
 ROOT = Path(__file__).resolve().parents[2]

@@ -5,7 +5,7 @@ from pathlib import Path
 import sentencepiece as spm
 import torch
 
-from gemma4_pytorch_codex.config import (
+from gemma4.config import (
     AttentionKind,
     AudioConfig,
     Gemma4Config,
@@ -13,10 +13,10 @@ from gemma4_pytorch_codex.config import (
     TextConfig,
     VisionConfig,
 )
-from gemma4_pytorch_codex.model import Gemma4Model
-from gemma4_pytorch_codex.text import Gemma4TextTower
-from gemma4_pytorch_codex.tokenizer import Gemma4Tokenizer
-from gemma4_pytorch_codex.vision import Gemma4VisionTower
+from gemma4.model import Gemma4Model
+from gemma4.text import Gemma4TextTower
+from gemma4.tokenizer import Gemma4Tokenizer
+from gemma4.vision import Gemma4VisionTower
 
 
 def make_tiny_text_config() -> TextConfig:
