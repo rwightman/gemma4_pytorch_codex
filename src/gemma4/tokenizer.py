@@ -8,9 +8,11 @@ from typing import Any
 
 import sentencepiece as spm
 import torch
+from tokenizers import Tokenizer as FastTokenizer
 
 
 TOKENIZER_MODEL_NAME = "tokenizer.model"
+TOKENIZER_JSON_NAME = "tokenizer.json"
 TOKENIZER_CONFIG_NAME = "tokenizer_config.json"
 
 
@@ -42,29 +44,47 @@ class Gemma4SpecialTokens:
 
 
 class Gemma4Tokenizer:
-    """SentencePiece tokenizer wrapper for Gemma 4."""
+    """Tokenizer wrapper for Gemma 4.
 
-    def __init__(self, model_file: str | Path) -> None:
-        self.model_file = Path(model_file)
+    This wrapper supports either the canonical SentencePiece model or an HF-style
+    `tokenizer.json` asset.
+    """
+
+    def __init__(self, tokenizer_file: str | Path) -> None:
+        self.tokenizer_file = Path(tokenizer_file)
+        self.model_file = self.tokenizer_file
+        self.special_tokens = Gemma4SpecialTokens()
+        self.sp_model: spm.SentencePieceProcessor | None = None
+        self.fast_tokenizer: FastTokenizer | None = None
+
+        if self.tokenizer_file.suffix == ".json":
+            try:
+                self.fast_tokenizer = FastTokenizer.from_file(str(self.tokenizer_file))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Failed to load tokenizer JSON from {self.tokenizer_file}."
+                ) from exc
+            self.backend = "tokenizers"
+            return
 
         try:
-            self.sp_model = spm.SentencePieceProcessor(model_file=str(self.model_file))
+            self.sp_model = spm.SentencePieceProcessor(model_file=str(self.tokenizer_file))
         except RuntimeError as exc:
             raise RuntimeError(
-                f"Failed to load SentencePiece model from {self.model_file}."
+                f"Failed to load SentencePiece model from {self.tokenizer_file}."
             ) from exc
 
-        self.special_tokens = Gemma4SpecialTokens()
+        self.backend = "sentencepiece"
 
     @classmethod
     def from_pretrained(
             cls,
             path: str | Path,
     ) -> "Gemma4Tokenizer":
-        """Load a tokenizer from a model file or model directory.
+        """Load a tokenizer from a file or tokenizer directory.
 
         Args:
-            path: Tokenizer model file or directory containing tokenizer assets.
+            path: Tokenizer file or directory containing tokenizer assets.
         """
         path = Path(path)
         if path.is_file():
@@ -80,13 +100,17 @@ class Gemma4Tokenizer:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid tokenizer config in {config_path}.") from exc
 
-            model_name = config.get("model_file", TOKENIZER_MODEL_NAME)
-            model_path = path / model_name
-            if model_path.exists():
-                return cls(model_path)
+            for config_key in ("model_file", "tokenizer_file"):
+                token_name = config.get(config_key)
+                if token_name is None:
+                    continue
+                token_path = path / str(token_name)
+                if token_path.exists():
+                    return cls(token_path)
 
         for candidate in (
             path / TOKENIZER_MODEL_NAME,
+            path / TOKENIZER_JSON_NAME,
             path / "gemma4_cleaned_262144.model",
             path / "tokenizer.spm",
         ):
@@ -96,7 +120,11 @@ class Gemma4Tokenizer:
         model_files = sorted(path.glob("*.model"))
         if model_files:
             return cls(model_files[0])
-        raise FileNotFoundError(f"Could not find a SentencePiece tokenizer model in {path}.")
+        json_files = sorted(path.glob("*.json"))
+        for candidate in json_files:
+            if candidate.name in {TOKENIZER_JSON_NAME, "tokenizer_fast.json"}:
+                return cls(candidate)
+        raise FileNotFoundError(f"Could not find a tokenizer asset in {path}.")
 
     def save_pretrained(
             self,
@@ -113,23 +141,26 @@ class Gemma4Tokenizer:
         except OSError as exc:
             raise OSError(f"Failed to create tokenizer directory {save_directory}.") from exc
 
-        target = save_directory / TOKENIZER_MODEL_NAME
-        if self.model_file.resolve() != target.resolve():
+        target_name = (
+            TOKENIZER_MODEL_NAME
+            if self.backend == "sentencepiece"
+            else TOKENIZER_JSON_NAME
+        )
+        target = save_directory / target_name
+        if self.tokenizer_file.resolve() != target.resolve():
             try:
-                shutil.copyfile(self.model_file, target)
+                shutil.copyfile(self.tokenizer_file, target)
             except OSError as exc:
-                raise OSError(f"Failed to copy tokenizer model to {target}.") from exc
+                raise OSError(f"Failed to copy tokenizer asset to {target}.") from exc
 
         try:
             with (save_directory / TOKENIZER_CONFIG_NAME).open("w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "tokenizer_class": type(self).__name__,
-                        "model_file": TOKENIZER_MODEL_NAME,
-                    },
-                    f,
-                    indent=2,
-                )
+                config_data = {"tokenizer_class": type(self).__name__}
+                if self.backend == "sentencepiece":
+                    config_data["model_file"] = TOKENIZER_MODEL_NAME
+                else:
+                    config_data["tokenizer_file"] = TOKENIZER_JSON_NAME
+                json.dump(config_data, f, indent=2)
         except OSError as exc:
             raise OSError(
                 f"Failed to write tokenizer config to {save_directory / TOKENIZER_CONFIG_NAME}."
@@ -142,7 +173,7 @@ class Gemma4Tokenizer:
             add_bos: bool = False,
             add_eos: bool = False,
     ) -> list[int]:
-        token_ids = list(self.sp_model.encode(text, out_type=int))
+        token_ids = self._encode_to_ids(text)
         if add_bos and self.bos_token_id is not None:
             token_ids.insert(0, self.bos_token_id)
         if add_eos and self.eos_token_id is not None:
@@ -167,7 +198,7 @@ class Gemma4Tokenizer:
                 for token_id in token_ids
                 if int(token_id) not in special_ids
             ]
-        return self.sp_model.decode(token_ids)
+        return self._decode_ids(token_ids, skip_special_tokens=skip_special_tokens)
 
     def batch_decode(
             self,
@@ -218,6 +249,13 @@ class Gemma4Tokenizer:
         }
 
     def token_to_id(self, token: str) -> int | None:
+        if self.fast_tokenizer is not None:
+            token_id = self.fast_tokenizer.token_to_id(token)
+            return None if token_id is None else int(token_id)
+
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
+
         token_id = int(self.sp_model.piece_to_id(token))
         if token_id < 0:
             return None
@@ -226,26 +264,50 @@ class Gemma4Tokenizer:
         return token_id
 
     def id_to_token(self, token_id: int) -> str:
+        if self.fast_tokenizer is not None:
+            token = self.fast_tokenizer.id_to_token(int(token_id))
+            if token is None:
+                raise KeyError(f"Unknown token id: {token_id}.")
+            return token
+
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
         return self.sp_model.id_to_piece(int(token_id))
 
     @property
     def vocab_size(self) -> int:
+        if self.fast_tokenizer is not None:
+            return int(self.fast_tokenizer.get_vocab_size())
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
         return int(self.sp_model.vocab_size())
 
     @property
     def pad_token_id(self) -> int:
-        return int(self.sp_model.pad_id())
+        return self._required_special_id(self.special_tokens.pad, "pad")
 
     @property
     def eos_token_id(self) -> int:
+        if self.fast_tokenizer is not None:
+            return self._required_special_id(self.special_tokens.eos, "eos")
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
         return int(self.sp_model.eos_id())
 
     @property
     def bos_token_id(self) -> int:
+        if self.fast_tokenizer is not None:
+            return self._required_special_id(self.special_tokens.bos, "bos")
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
         return int(self.sp_model.bos_id())
 
     @property
     def unk_token_id(self) -> int:
+        if self.fast_tokenizer is not None:
+            return self._required_special_id(self.special_tokens.unk, "unk")
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
         return int(self.sp_model.unk_id())
 
     @property
@@ -301,3 +363,23 @@ class Gemma4Tokenizer:
             self.unk_token_id,
         }
         return required_ids | {token_id for token_id in optional_ids if token_id is not None}
+
+    def _encode_to_ids(self, text: str) -> list[int]:
+        if self.fast_tokenizer is not None:
+            return list(self.fast_tokenizer.encode(text).ids)
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
+        return list(self.sp_model.encode(text, out_type=int))
+
+    def _decode_ids(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        if self.fast_tokenizer is not None:
+            return self.fast_tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer backend was not initialized.")
+        return self.sp_model.decode(token_ids)
+
+    def _required_special_id(self, token: str, token_name: str) -> int:
+        token_id = self.token_to_id(token)
+        if token_id is None:
+            raise KeyError(f"Tokenizer is missing the required {token_name} token {token!r}.")
+        return token_id

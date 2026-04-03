@@ -114,6 +114,7 @@ class Gemma4VisionAttention(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
+        self.attn_impl = config.attn_impl
         self.num_heads = config.num_heads
         self.num_kv_heads = config.num_kv_heads
         self.head_dim = config.head_dim
@@ -157,28 +158,41 @@ class Gemma4VisionAttention(nn.Module):
         ).transpose(1, 2)
         value = value.transpose(1, 2)
 
-        if self.num_key_value_groups > 1:
-            key = key[:, :, None].expand(
-                batch_size,
-                self.num_kv_heads,
-                self.num_key_value_groups,
-                seq_len,
-                self.head_dim,
+        if self.attn_impl == "sdpa":
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask[:, None, :, :],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+                enable_gqa=self.num_key_value_groups > 1,
             )
-            key = key.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-            value = value[:, :, None].expand(
-                batch_size,
-                self.num_kv_heads,
-                self.num_key_value_groups,
-                seq_len,
-                self.head_dim,
-            )
-            value = value.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+        else:
+            if self.num_key_value_groups > 1:
+                key = key[:, :, None].expand(
+                    batch_size,
+                    self.num_kv_heads,
+                    self.num_key_value_groups,
+                    seq_len,
+                    self.head_dim,
+                )
+                key = key.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+                value = value[:, :, None].expand(
+                    batch_size,
+                    self.num_kv_heads,
+                    self.num_key_value_groups,
+                    seq_len,
+                    self.head_dim,
+                )
+                value = value.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
 
-        attn_logits = torch.matmul(query, key.transpose(-1, -2))
-        attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], float("-inf"))
-        attn_probs = F.softmax(attn_logits.float(), dim=-1).to(dtype=query.dtype)
-        attn_output = torch.matmul(attn_probs, value)
+            attn_logits = torch.matmul(query, key.transpose(-1, -2))
+            attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], float("-inf"))
+            attn_probs = F.softmax(attn_logits.float(), dim=-1).to(dtype=query.dtype)
+            attn_output = torch.matmul(attn_probs, value)
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 

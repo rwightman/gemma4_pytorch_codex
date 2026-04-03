@@ -9,6 +9,7 @@ from typing import Literal, TypeAlias
 JsonValue: TypeAlias = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
+AttentionImpl: TypeAlias = Literal["eager", "sdpa"]
 
 
 class AttentionKind(str, enum.Enum):
@@ -94,6 +95,7 @@ class TextConfig:
     audio_placeholder_token_id: int = -4
     rms_norm_eps: float = 1e-6
     init_std: float = 1e-2
+    attn_impl: AttentionImpl = "eager"
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -110,6 +112,8 @@ class TextConfig:
             layer_types = list(self.layer_types)
             layer_types[-1] = AttentionKind.FULL
             self.layer_types = tuple(layer_types)
+
+        _validate_attn_impl(self.attn_impl)
 
 
 @dataclass
@@ -132,6 +136,10 @@ class VisionConfig:
     init_std: float = 1e-2
     position_init_std: float = 2e-2
     projection_norm_eps: float = 1e-6
+    attn_impl: AttentionImpl = "eager"
+
+    def __post_init__(self) -> None:
+        _validate_attn_impl(self.attn_impl)
 
     @property
     def max_patches(self) -> int:
@@ -173,6 +181,7 @@ class AudioConfig:
     rms_norm_eps: float = 1e-6
     init_std: float = 1e-2
     feature_init_std: float = 1e-2
+    projection_norm_before_text: bool = False
 
 
 @dataclass
@@ -210,6 +219,11 @@ def _to_jsonable(value: object) -> JsonValue:
     return value
 
 
+def _validate_attn_impl(attn_impl: str) -> None:
+    if attn_impl not in {"eager", "sdpa"}:
+        raise ValueError(f"Unsupported attention implementation: {attn_impl}.")
+
+
 def _restore_text_config(data: JsonValue) -> dict[str, object]:
     if not isinstance(data, dict):
         raise TypeError(f"Expected a text config mapping, got {type(data).__name__}.")
@@ -224,7 +238,7 @@ def _restore_text_config(data: JsonValue) -> dict[str, object]:
     return restored
 
 
-def _small_vision_config() -> VisionConfig:
+def _small_vision_config(attn_impl: AttentionImpl = "eager") -> VisionConfig:
     return VisionConfig(
         hidden_size=768,
         intermediate_size=3_072,
@@ -236,10 +250,11 @@ def _small_vision_config() -> VisionConfig:
         pooling_kernel_size=3,
         use_clipped_linears=True,
         standardize_embeddings=False,
+        attn_impl=attn_impl,
     )
 
 
-def _large_vision_config() -> VisionConfig:
+def _large_vision_config(attn_impl: AttentionImpl = "eager") -> VisionConfig:
     return VisionConfig(
         hidden_size=1_152,
         intermediate_size=4_304,
@@ -251,6 +266,7 @@ def _large_vision_config() -> VisionConfig:
         pooling_kernel_size=3,
         use_clipped_linears=False,
         standardize_embeddings=True,
+        attn_impl=attn_impl,
     )
 
 
@@ -258,7 +274,11 @@ def _default_audio_config() -> AudioConfig:
     return AudioConfig()
 
 
-def gemma4_e2b_config(text_only: bool = False) -> Gemma4Config:
+def gemma4_e2b_config(
+        text_only: bool = False,
+        *,
+        attn_impl: AttentionImpl = "eager",
+) -> Gemma4Config:
     """Build the Gemma 4 E2B preset."""
     text = TextConfig(
         hidden_size=1_536,
@@ -276,15 +296,20 @@ def gemma4_e2b_config(text_only: bool = False) -> Gemma4Config:
         kv_sharing=KVSharingConfig(frac_shared_layers=20.0 / 35.0),
         override_kv_shared_ffn_hidden=4 * 1_536 * 2,
         final_logit_softcap=30.0,
+        attn_impl=attn_impl,
     )
     return Gemma4Config(
         text=text,
-        vision=None if text_only else _small_vision_config(),
+        vision=None if text_only else _small_vision_config(attn_impl=attn_impl),
         audio=None if text_only else _default_audio_config(),
     )
 
 
-def gemma4_e4b_config(text_only: bool = False) -> Gemma4Config:
+def gemma4_e4b_config(
+        text_only: bool = False,
+        *,
+        attn_impl: AttentionImpl = "eager",
+) -> Gemma4Config:
     """Build the Gemma 4 E4B preset."""
     text = TextConfig(
         hidden_size=2_560,
@@ -301,15 +326,20 @@ def gemma4_e4b_config(text_only: bool = False) -> Gemma4Config:
         per_layer_input_dim=256,
         kv_sharing=KVSharingConfig(frac_shared_layers=18.0 / 42.0),
         final_logit_softcap=30.0,
+        attn_impl=attn_impl,
     )
     return Gemma4Config(
         text=text,
-        vision=None if text_only else _small_vision_config(),
+        vision=None if text_only else _small_vision_config(attn_impl=attn_impl),
         audio=None if text_only else _default_audio_config(),
     )
 
 
-def gemma4_31b_config(text_only: bool = False) -> Gemma4Config:
+def gemma4_31b_config(
+        text_only: bool = False,
+        *,
+        attn_impl: AttentionImpl = "eager",
+) -> Gemma4Config:
     """Build the Gemma 4 31B preset."""
     text = TextConfig(
         hidden_size=5_376,
@@ -329,15 +359,20 @@ def gemma4_31b_config(text_only: bool = False) -> Gemma4Config:
         per_layer_input_dim=0,
         use_bidirectional_attention="vision",
         final_logit_softcap=30.0,
+        attn_impl=attn_impl,
     )
     return Gemma4Config(
         text=text,
-        vision=None if text_only else _large_vision_config(),
+        vision=None if text_only else _large_vision_config(attn_impl=attn_impl),
         audio=None,
     )
 
 
-def gemma4_26b_a4b_config(text_only: bool = False) -> Gemma4Config:
+def gemma4_26b_a4b_config(
+        text_only: bool = False,
+        *,
+        attn_impl: AttentionImpl = "eager",
+) -> Gemma4Config:
     """Build the Gemma 4 26B-A4B MoE preset."""
     text = TextConfig(
         hidden_size=2_816,
@@ -362,9 +397,10 @@ def gemma4_26b_a4b_config(text_only: bool = False) -> Gemma4Config:
         top_k_experts=8,
         moe_dense_hidden_size=2_112,
         final_logit_softcap=30.0,
+        attn_impl=attn_impl,
     )
     return Gemma4Config(
         text=text,
-        vision=None if text_only else _large_vision_config(),
+        vision=None if text_only else _large_vision_config(attn_impl=attn_impl),
         audio=None,
     )

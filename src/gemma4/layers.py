@@ -257,7 +257,7 @@ def apply_text_rope(
         head_dim,
         rotary_half,
     )
-    return torch.cat([first_half, second_half], dim=-1)
+    return torch.cat([first_half, second_half], dim=-1).to(dtype=x.dtype)
 
 
 def apply_multidim_rope(
@@ -300,4 +300,4 @@ def apply_multidim_rope(
         )
     if remainder > 0:
         out_parts.append(parts[-1])
-    return torch.cat(out_parts, dim=-1)
+    return torch.cat(out_parts, dim=-1).to(dtype=x.dtype)

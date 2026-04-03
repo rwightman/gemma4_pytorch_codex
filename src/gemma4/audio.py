@@ -329,6 +329,7 @@ class Gemma4AudioEncoder(nn.Module):
 class Gemma4AudioTower(nn.Module):
     def __init__(self, config: AudioConfig, text_hidden_size: int | None = None) -> None:
         super().__init__()
+        self.config = config
         self.encoder = Gemma4AudioEncoder(config)
         self.to_text = None
         self.to_text_norm = None
@@ -337,7 +338,8 @@ class Gemma4AudioTower(nn.Module):
                 nn.Linear(config.output_size, text_hidden_size, bias=False),
                 config.init_std,
             )
-            self.to_text_norm = RMSNorm(text_hidden_size, eps=config.rms_norm_eps, with_scale=False)
+            norm_dim = config.output_size if config.projection_norm_before_text else text_hidden_size
+            self.to_text_norm = RMSNorm(norm_dim, eps=config.rms_norm_eps, with_scale=False)
 
     def forward(self, features: torch.Tensor, feature_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder(features, feature_mask)
@@ -355,8 +357,12 @@ class Gemma4AudioTower(nn.Module):
 
         tokens, pad_mask = self.encoder(features, feature_mask)
         if self.to_text is not None:
-            tokens = self.to_text(tokens)
-            tokens = self.to_text_norm(tokens)
+            if self.config.projection_norm_before_text:
+                tokens = self.to_text_norm(tokens)
+                tokens = self.to_text(tokens)
+            else:
+                tokens = self.to_text(tokens)
+                tokens = self.to_text_norm(tokens)
 
         valid_mask = ~pad_mask
         if flatten_groups:

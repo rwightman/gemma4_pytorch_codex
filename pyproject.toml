@@ -9,16 +9,25 @@ description = "Canonical PyTorch implementation of the Gemma 4 model family."
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [
+    "numpy",
     "torch>=2.1",
     "sentencepiece",
+    "tokenizers",
     "safetensors",
 ]
+
+[project.scripts]
+gemma4-convert = "gemma4.convert:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "jax",
     "flax",
+]
+convert = [
+    "jax",
+    "orbax-checkpoint",
 ]
 
 [tool.pdm.build]

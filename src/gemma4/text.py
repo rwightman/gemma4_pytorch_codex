@@ -139,6 +139,7 @@ class Gemma4TextAttention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
+        self.attn_impl = config.attn_impl
         self.is_full = self.layer_type == AttentionKind.FULL
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -184,6 +185,9 @@ class Gemma4TextAttention(nn.Module):
         self.q_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale)
         self.k_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale)
         self.v_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=False)
+
+        if self.attn_impl == "sdpa" and self.attn_logits_softcap is not None:
+            raise ValueError("`attn_logits_softcap` is not supported with `attn_impl='sdpa'`.")
 
     def forward(
             self,
@@ -232,12 +236,6 @@ class Gemma4TextAttention(nn.Module):
             key = layer_cache.key
             value = layer_cache.value
 
-        repeated_key = repeat_kv(key, self.num_key_value_groups)
-        repeated_value = repeat_kv(value, self.num_key_value_groups)
-        attn_logits = torch.matmul(query, repeated_key.transpose(-1, -2))
-        if self.attn_logits_softcap is not None:
-            attn_logits = torch.tanh(attn_logits / self.attn_logits_softcap) * self.attn_logits_softcap
-
         if self.sliding_window is not None:
             attention_mask = attention_mask & create_sliding_mask(
                 positions,
@@ -245,9 +243,28 @@ class Gemma4TextAttention(nn.Module):
                 cache_positions=layer_cache.positions,
             )
 
-        attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], K_MASK)
-        attn_probs = F.softmax(attn_logits.float(), dim=-1).to(dtype=query.dtype)
-        attn_output = torch.matmul(attn_probs, repeated_value)
+        if self.attn_impl == "sdpa":
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask[:, None, :, :],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+                enable_gqa=self.num_key_value_groups > 1,
+            )
+        else:
+            repeated_key = repeat_kv(key, self.num_key_value_groups)
+            repeated_value = repeat_kv(value, self.num_key_value_groups)
+            attn_logits = torch.matmul(query, repeated_key.transpose(-1, -2))
+            if self.attn_logits_softcap is not None:
+                attn_logits = torch.tanh(attn_logits / self.attn_logits_softcap) * self.attn_logits_softcap
+
+            attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], K_MASK)
+            attn_probs = F.softmax(attn_logits.float(), dim=-1).to(dtype=query.dtype)
+            attn_output = torch.matmul(attn_probs, repeated_value)
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.key_dim)
         return self.o_proj(attn_output), layer_cache
 

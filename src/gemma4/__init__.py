@@ -1,5 +1,6 @@
 from .config import (
     AttentionKind,
+    AttentionImpl,
     AudioConfig,
     Gemma4Config,
     KVSharingConfig,
@@ -11,6 +12,18 @@ from .config import (
     gemma4_e4b_config,
     make_attention_layer_types,
 )
+from .convert import (
+    convert_hf_checkpoint,
+    convert_hf_state_dict_to_native,
+    convert_jax_tree_to_native,
+    convert_orbax_checkpoint,
+    load_hf_config,
+    load_hf_state_dict,
+    native_config_from_hf_dict,
+    native_config_from_hf_path,
+    resolve_variant_config,
+    restore_orbax_checkpoint,
+)
 from .audio import Gemma4AudioEncoder, Gemma4AudioTower
 from .model import Gemma4Model, Gemma4Output
 from .text import Gemma4TextTower, LayerKVCache, TextKVCache
@@ -19,6 +32,7 @@ from .vision import Gemma4VisionEncoder, Gemma4VisionTower, patchify_images
 
 __all__ = [
     "AttentionKind",
+    "AttentionImpl",
     "AudioConfig",
     "Gemma4AudioEncoder",
     "Gemma4AudioTower",
@@ -35,10 +49,20 @@ __all__ = [
     "TextConfig",
     "TextKVCache",
     "VisionConfig",
+    "convert_hf_checkpoint",
+    "convert_hf_state_dict_to_native",
+    "convert_jax_tree_to_native",
+    "convert_orbax_checkpoint",
     "gemma4_26b_a4b_config",
     "gemma4_31b_config",
     "gemma4_e2b_config",
     "gemma4_e4b_config",
+    "load_hf_config",
+    "load_hf_state_dict",
     "make_attention_layer_types",
+    "native_config_from_hf_dict",
+    "native_config_from_hf_path",
     "patchify_images",
+    "resolve_variant_config",
+    "restore_orbax_checkpoint",
 ]

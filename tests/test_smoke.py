@@ -4,6 +4,9 @@ from pathlib import Path
 
 import sentencepiece as spm
 import torch
+from tokenizers import Tokenizer as FastTokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 
 from gemma4.config import (
     AttentionKind,
@@ -42,6 +45,12 @@ def make_tiny_text_config() -> TextConfig:
     )
 
 
+def make_tiny_text_config_for_impl(attn_impl: str) -> TextConfig:
+    config = make_tiny_text_config()
+    config.attn_impl = attn_impl
+    return config
+
+
 def make_tiny_vision_config() -> VisionConfig:
     return VisionConfig(
         hidden_size=24,
@@ -56,6 +65,12 @@ def make_tiny_vision_config() -> VisionConfig:
         pooling_kernel_size=1,
         use_clipped_linears=False,
     )
+
+
+def make_tiny_vision_config_for_impl(attn_impl: str) -> VisionConfig:
+    config = make_tiny_vision_config()
+    config.attn_impl = attn_impl
+    return config
 
 
 def make_tiny_audio_config() -> AudioConfig:
@@ -74,8 +89,34 @@ def make_tiny_audio_config() -> AudioConfig:
 
 
 def test_text_tower_forward_shapes() -> None:
-    config = make_tiny_text_config()
-    model = Gemma4TextTower(config)
+    for attn_impl in ("eager", "sdpa"):
+        config = make_tiny_text_config_for_impl(attn_impl)
+        model = Gemma4TextTower(config)
+        input_ids = torch.tensor(
+            [
+                [1, 2, 3, 4, 5, 6, 0, 0],
+                [7, 8, 9, 10, 11, 12, 13, 0],
+            ]
+        )
+        attention_mask = input_ids != 0
+        positions = attention_mask.long().cumsum(dim=-1).sub(1).clamp_min_(0)
+        full_mask = attention_mask[:, None, :] & torch.tril(torch.ones(8, 8, dtype=torch.bool)).unsqueeze(0)
+        hidden = model(
+            input_ids,
+            position_ids=positions,
+            full_attention_mask=full_mask,
+            sliding_attention_mask=full_mask,
+        )
+        assert hidden.shape == (2, 8, 32)
+        logits = model.project_logits(hidden)
+        assert logits.shape == (2, 8, 64)
+
+
+def test_text_tower_sdpa_matches_eager() -> None:
+    eager = Gemma4TextTower(make_tiny_text_config_for_impl("eager"))
+    sdpa = Gemma4TextTower(make_tiny_text_config_for_impl("sdpa"))
+    sdpa.load_state_dict(eager.state_dict())
+
     input_ids = torch.tensor(
         [
             [1, 2, 3, 4, 5, 6, 0, 0],
@@ -85,25 +126,60 @@ def test_text_tower_forward_shapes() -> None:
     attention_mask = input_ids != 0
     positions = attention_mask.long().cumsum(dim=-1).sub(1).clamp_min_(0)
     full_mask = attention_mask[:, None, :] & torch.tril(torch.ones(8, 8, dtype=torch.bool)).unsqueeze(0)
-    hidden = model(
+
+    eager_hidden = eager(
         input_ids,
         position_ids=positions,
         full_attention_mask=full_mask,
         sliding_attention_mask=full_mask,
     )
-    assert hidden.shape == (2, 8, 32)
-    logits = model.project_logits(hidden)
-    assert logits.shape == (2, 8, 64)
+    sdpa_hidden = sdpa(
+        input_ids,
+        position_ids=positions,
+        full_attention_mask=full_mask,
+        sliding_attention_mask=full_mask,
+    )
+
+    torch.testing.assert_close(eager_hidden, sdpa_hidden, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        eager.project_logits(eager_hidden),
+        sdpa.project_logits(sdpa_hidden),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_vision_tower_is_reusable() -> None:
-    text_config = make_tiny_text_config()
-    vision = Gemma4VisionTower(make_tiny_vision_config(), text_hidden_size=text_config.hidden_size)
+    for attn_impl in ("eager", "sdpa"):
+        text_config = make_tiny_text_config_for_impl(attn_impl)
+        vision = Gemma4VisionTower(
+            make_tiny_vision_config_for_impl(attn_impl),
+            text_hidden_size=text_config.hidden_size,
+        )
+        images = torch.rand(1, 2, 4, 4, 3)
+        tokens, mask = vision.encode_to_text(images)
+        assert tokens.shape == (1, 8, text_config.hidden_size)
+        assert mask.shape == (1, 8)
+        assert mask.all()
+
+
+def test_vision_sdpa_matches_eager() -> None:
+    eager = Gemma4VisionTower(
+        make_tiny_vision_config_for_impl("eager"),
+        text_hidden_size=make_tiny_text_config().hidden_size,
+    )
+    sdpa = Gemma4VisionTower(
+        make_tiny_vision_config_for_impl("sdpa"),
+        text_hidden_size=make_tiny_text_config().hidden_size,
+    )
+    sdpa.load_state_dict(eager.state_dict())
+
     images = torch.rand(1, 2, 4, 4, 3)
-    tokens, mask = vision.encode_to_text(images)
-    assert tokens.shape == (1, 8, text_config.hidden_size)
-    assert mask.shape == (1, 8)
-    assert mask.all()
+    eager_tokens, eager_mask = eager.encode_to_text(images)
+    sdpa_tokens, sdpa_mask = sdpa.encode_to_text(images)
+
+    torch.testing.assert_close(eager_tokens, sdpa_tokens, atol=1e-5, rtol=1e-5)
+    assert torch.equal(eager_mask, sdpa_mask)
 
 
 def test_audio_tower_shapes() -> None:
@@ -140,42 +216,66 @@ def test_multimodal_placeholder_merge() -> None:
 
 
 def test_kv_cache_matches_full_forward() -> None:
-    model = Gemma4Model(Gemma4Config(text=make_tiny_text_config()))
-    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-    full_out = model(input_ids, attention_mask=torch.ones_like(input_ids, dtype=torch.bool))
+    for attn_impl in ("eager", "sdpa"):
+        model = Gemma4Model(Gemma4Config(text=make_tiny_text_config_for_impl(attn_impl)))
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        full_out = model(input_ids, attention_mask=torch.ones_like(input_ids, dtype=torch.bool))
 
-    prefill_ids = input_ids[:, :5]
-    prefill_out = model(
-        prefill_ids,
-        attention_mask=torch.ones_like(prefill_ids, dtype=torch.bool),
-        return_kv_cache=True,
-    )
-    kv_cache = prefill_out.kv_cache
-    assert kv_cache is not None
-
-    for pos in range(5, input_ids.shape[1]):
-        step_ids = input_ids[:, pos : pos + 1]
-        step_out = model(
-            step_ids,
-            attention_mask=torch.ones_like(step_ids, dtype=torch.bool),
-            kv_cache=kv_cache,
+        prefill_ids = input_ids[:, :5]
+        prefill_out = model(
+            prefill_ids,
+            attention_mask=torch.ones_like(prefill_ids, dtype=torch.bool),
             return_kv_cache=True,
         )
-        kv_cache = step_out.kv_cache
+        kv_cache = prefill_out.kv_cache
         assert kv_cache is not None
-        torch.testing.assert_close(
-            step_out.logits[:, -1],
-            full_out.logits[:, pos],
-            atol=1e-5,
-            rtol=1e-5,
-        )
+
+        for pos in range(5, input_ids.shape[1]):
+            step_ids = input_ids[:, pos : pos + 1]
+            step_out = model(
+                step_ids,
+                attention_mask=torch.ones_like(step_ids, dtype=torch.bool),
+                kv_cache=kv_cache,
+                return_kv_cache=True,
+            )
+            kv_cache = step_out.kv_cache
+            assert kv_cache is not None
+            torch.testing.assert_close(
+                step_out.logits[:, -1],
+                full_out.logits[:, pos],
+                atol=1e-5,
+                rtol=1e-5,
+            )
 
 
 def test_generate_with_cache() -> None:
+    for attn_impl in ("eager", "sdpa"):
+        model = Gemma4Model(Gemma4Config(text=make_tiny_text_config_for_impl(attn_impl)))
+        prompt = torch.tensor([[1, 2, 3, 4]])
+        generated = model.generate(prompt, max_new_tokens=3, do_sample=False)
+        assert generated.shape == (1, 7)
+
+
+def test_generate_with_cache_bfloat16() -> None:
+    for attn_impl in ("eager", "sdpa"):
+        model = Gemma4Model(Gemma4Config(text=make_tiny_text_config_for_impl(attn_impl)))
+        model = model.to(dtype=torch.bfloat16)
+        prompt = torch.tensor([[1, 2, 3, 4]])
+        generated = model.generate(prompt, max_new_tokens=3, do_sample=False)
+        assert generated.shape == (1, 7)
+
+
+def test_from_pretrained_attn_impl_override(tmp_path: Path) -> None:
     model = Gemma4Model(Gemma4Config(text=make_tiny_text_config()))
+    save_dir = tmp_path / "override_attn_impl"
+    model.save_pretrained(save_dir)
+
+    reloaded = Gemma4Model.from_pretrained(save_dir, attn_impl="sdpa")
+    assert reloaded.config.text.attn_impl == "sdpa"
+
     prompt = torch.tensor([[1, 2, 3, 4]])
-    generated = model.generate(prompt, max_new_tokens=3, do_sample=False)
-    assert generated.shape == (1, 7)
+    generated = reloaded.generate(prompt, max_new_tokens=2, do_sample=False)
+    assert generated.shape == (1, 6)
 
 
 def _train_tiny_sentencepiece_model(tmp_path: Path) -> Path:
@@ -216,6 +316,29 @@ def _train_tiny_sentencepiece_model(tmp_path: Path) -> Path:
     return model_prefix.with_suffix(".model")
 
 
+def _build_tiny_tokenizer_json(tmp_path: Path) -> Path:
+    vocab = {
+        "<pad>": 0,
+        "<eos>": 1,
+        "<bos>": 2,
+        "<unk>": 3,
+        "<mask>": 4,
+        "<|image|>": 5,
+        "<|image>": 6,
+        "<image|>": 7,
+        "<|audio|>": 8,
+        "<|audio>": 9,
+        "<audio|>": 10,
+        "hello": 11,
+        "world": 12,
+    }
+    tokenizer = FastTokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(tokenizer_path))
+    return tokenizer_path
+
+
 def test_tokenizer_and_pretrained_roundtrip(tmp_path: Path) -> None:
     tokenizer_model = _train_tiny_sentencepiece_model(tmp_path)
     tokenizer = Gemma4Tokenizer(tokenizer_model)
@@ -248,6 +371,34 @@ def test_tokenizer_and_pretrained_roundtrip(tmp_path: Path) -> None:
     torch.testing.assert_close(original, restored)
 
     generated = reloaded_model.generate_text(
+        reloaded_tokenizer,
+        "hello world",
+        max_new_tokens=2,
+        do_sample=False,
+    )
+    assert isinstance(generated, str)
+
+
+def test_tokenizer_json_and_pretrained_roundtrip(tmp_path: Path) -> None:
+    tokenizer_file = _build_tiny_tokenizer_json(tmp_path)
+    tokenizer = Gemma4Tokenizer(tokenizer_file)
+
+    encoded = tokenizer("hello world", add_bos=True, return_tensors="pt")
+    assert encoded["input_ids"].shape == (1, encoded["attention_mask"].shape[1])
+    assert encoded["attention_mask"].dtype == torch.bool
+    assert tokenizer.bos_token_id == 2
+    assert tokenizer.eos_token_id == 1
+
+    save_dir = tmp_path / "fast_pretrained"
+    tokenizer.save_pretrained(save_dir)
+
+    reloaded_tokenizer = Gemma4Tokenizer.from_pretrained(save_dir)
+    assert reloaded_tokenizer.vocab_size == tokenizer.vocab_size
+    assert reloaded_tokenizer.decode(encoded["input_ids"][0], skip_special_tokens=True) == "hello world"
+
+    model = Gemma4Model(Gemma4Config(text=make_tiny_text_config()))
+    model.eval()
+    generated = model.generate_text(
         reloaded_tokenizer,
         "hello world",
         max_new_tokens=2,

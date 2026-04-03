@@ -393,6 +393,7 @@ class Gemma4Model(nn.Module):
             device: str | torch.device = "cpu",
             dtype: torch.dtype | None = None,
             strict: bool = True,
+            attn_impl: str | None = None,
     ) -> Gemma4Model:
         """Load a model from a local directory.
 
@@ -401,6 +402,7 @@ class Gemma4Model(nn.Module):
             device: Target device for the loaded model.
             dtype: Optional parameter dtype cast after loading.
             strict: Whether to require an exact state-dict match.
+            attn_impl: Optional attention implementation override for text and vision towers.
         """
         load_directory = Path(load_directory)
         config_path = load_directory / CONFIG_NAME
@@ -414,6 +416,13 @@ class Gemma4Model(nn.Module):
             raise OSError(f"Failed to read config from {config_path}.") from exc
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid config JSON in {config_path}.") from exc
+
+        if attn_impl is not None:
+            config.text.attn_impl = attn_impl
+            config.text.__post_init__()
+            if config.vision is not None:
+                config.vision.attn_impl = attn_impl
+                config.vision.__post_init__()
 
         model = cls(config)
         safe_path = load_directory / SAFE_WEIGHTS_NAME
