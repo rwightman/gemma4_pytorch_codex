@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from gemma4 import (
+from gemma4_pt_codex import (
     Gemma4Config,
     Gemma4Model,
     TextConfig,
@@ -11,7 +11,7 @@ from gemma4 import (
     gemma4_e2b_config,
     gemma4_e4b_config,
 )
-from gemma4.layers import (
+from gemma4_pt_codex.layers import (
     RMSNorm,
     build_positions_from_mask,
     create_sliding_mask,

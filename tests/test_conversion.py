@@ -6,9 +6,9 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file as save_safetensors
 
-from gemma4 import AudioConfig, Gemma4Config, Gemma4Model, TextConfig, VisionConfig
-from gemma4.config import AttentionKind
-from gemma4.convert import (
+from gemma4_pt_codex import AudioConfig, Gemma4Config, Gemma4Model, TextConfig, VisionConfig
+from gemma4_pt_codex.config import AttentionKind
+from gemma4_pt_codex.convert import (
     convert_hf_checkpoint,
     convert_hf_state_dict_to_native,
     convert_jax_tree_to_native,

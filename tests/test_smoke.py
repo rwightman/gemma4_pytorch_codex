@@ -8,7 +8,7 @@ from tokenizers import Tokenizer as FastTokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
-from gemma4.config import (
+from gemma4_pt_codex.config import (
     AttentionKind,
     AudioConfig,
     Gemma4Config,
@@ -16,10 +16,10 @@ from gemma4.config import (
     TextConfig,
     VisionConfig,
 )
-from gemma4.model import Gemma4Model
-from gemma4.text import Gemma4TextTower
-from gemma4.tokenizer import Gemma4Tokenizer
-from gemma4.vision import Gemma4VisionTower
+from gemma4_pt_codex.model import Gemma4Model
+from gemma4_pt_codex.text import Gemma4TextTower
+from gemma4_pt_codex.tokenizer import Gemma4Tokenizer
+from gemma4_pt_codex.vision import Gemma4VisionTower
 
 
 def make_tiny_text_config() -> TextConfig:
