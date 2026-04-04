@@ -16,7 +16,8 @@ from gemma4_pt_codex.config import (
     TextConfig,
     VisionConfig,
 )
-from gemma4_pt_codex.model import Gemma4Model
+from gemma4_pt_codex.model import Gemma4Model, Gemma4PreparedInputs
+from gemma4_pt_codex.processing import Gemma4Processor
 from gemma4_pt_codex.text import Gemma4TextTower
 from gemma4_pt_codex.tokenizer import Gemma4Tokenizer
 from gemma4_pt_codex.vision import Gemma4VisionTower
@@ -110,6 +111,20 @@ def test_text_tower_forward_shapes() -> None:
         assert hidden.shape == (2, 8, 32)
         logits = model.project_logits(hidden)
         assert logits.shape == (2, 8, 64)
+
+
+def test_text_embedding_wraps_internal_negative_placeholder_ids() -> None:
+    model = Gemma4TextTower(make_tiny_text_config())
+    input_ids = torch.tensor([[1, -2, -4, 0]], dtype=torch.long)
+
+    embedded = model.embed_tokens(input_ids)
+    expected_ids = torch.tensor(
+        [[1, model.config.vocab_size - 2, model.config.vocab_size - 4, 0]],
+        dtype=torch.long,
+    )
+    expected = model.token_embedding(expected_ids)
+
+    torch.testing.assert_close(embedded, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_text_tower_sdpa_matches_eager() -> None:
@@ -404,4 +419,94 @@ def test_tokenizer_json_and_pretrained_roundtrip(tmp_path: Path) -> None:
         max_new_tokens=2,
         do_sample=False,
     )
+    assert isinstance(generated, str)
+
+
+def test_processor_expands_visible_image_placeholder_tokens(tmp_path: Path) -> None:
+    tokenizer = Gemma4Tokenizer(_build_tiny_tokenizer_json(tmp_path))
+    processor = Gemma4Processor(
+        tokenizer=tokenizer,
+        text_config=make_tiny_text_config(),
+    )
+
+    expanded = processor.expand_image_placeholders(
+        [11, 5, 12],
+        [3],
+        begin_image_token_id=6,
+        end_image_token_id=7,
+        double_newline_token_ids=[108],
+    )
+
+    assert expanded == [11, 108, 6, -2, -2, -2, 7, 108, 12]
+
+
+def test_prepare_inputs_expands_images_into_internal_soft_tokens(tmp_path: Path) -> None:
+    tokenizer = Gemma4Tokenizer(_train_tiny_sentencepiece_model(tmp_path))
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            vision=make_tiny_vision_config(),
+        )
+    )
+    images = torch.rand(1, 4, 4, 3)
+
+    batch = model.prepare_inputs(
+        tokenizer,
+        "hello <|image|> world",
+        images=images,
+    )
+
+    assert isinstance(batch, Gemma4PreparedInputs)
+    placeholder_mask = batch.input_ids == model.config.text.image_placeholder_token_id
+    assert int(placeholder_mask.sum()) == 4
+    assert batch.vision_tokens is not None
+    assert batch.vision_token_mask is not None
+    assert batch.vision_tokens.shape == (1, 4, model.config.text.hidden_size)
+    assert int(batch.vision_token_mask.sum()) == 4
+
+    forward_kwargs = batch.as_forward_kwargs()
+    assert torch.equal(forward_kwargs["input_ids"], batch.input_ids)
+    assert torch.equal(forward_kwargs["attention_mask"], batch.attention_mask)
+    assert torch.equal(forward_kwargs["vision_tokens"], batch.vision_tokens)
+    assert torch.equal(forward_kwargs["vision_token_mask"], batch.vision_token_mask)
+    assert torch.equal(batch["input_ids"], batch.input_ids)
+    assert batch.get("vision_tokens") is batch.vision_tokens
+
+
+def test_prepared_inputs_to_preserves_masks_and_casts_embeddings() -> None:
+    prepared = Gemma4PreparedInputs(
+        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.tensor([[True, True, True]]),
+        vision_tokens=torch.randn(1, 2, 4, dtype=torch.float32),
+        vision_token_mask=torch.tensor([[True, False]]),
+    )
+
+    moved = prepared.to("cpu", dtype=torch.bfloat16)
+
+    assert moved.input_ids.dtype == torch.long
+    assert moved.attention_mask.dtype == torch.bool
+    assert moved.vision_tokens is not None
+    assert moved.vision_tokens.dtype == torch.bfloat16
+    assert moved.vision_token_mask is not None
+    assert moved.vision_token_mask.dtype == torch.bool
+
+
+def test_generate_text_accepts_images(tmp_path: Path) -> None:
+    tokenizer = Gemma4Tokenizer(_train_tiny_sentencepiece_model(tmp_path))
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            vision=make_tiny_vision_config(),
+        )
+    )
+    model.eval()
+
+    generated = model.generate_text(
+        tokenizer,
+        "hello <|image|> world",
+        images=torch.rand(1, 4, 4, 3),
+        max_new_tokens=2,
+        do_sample=False,
+    )
+
     assert isinstance(generated, str)

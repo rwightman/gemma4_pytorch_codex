@@ -91,6 +91,8 @@ class TextConfig:
     top_k_experts: int = 0
     moe_dense_hidden_size: int = 0
     pad_token_id: int = 0
+    image_token_id: int = 258_880
+    audio_token_id: int = 258_881
     image_placeholder_token_id: int = -2
     audio_placeholder_token_id: int = -4
     rms_norm_eps: float = 1e-6

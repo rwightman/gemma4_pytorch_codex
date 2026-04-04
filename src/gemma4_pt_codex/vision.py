@@ -7,8 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import VisionConfig
+from .image_processing import (
+    Gemma4ImageBatch,
+    Gemma4ImageProcessor,
+    ImageBatchInput,
+    normalize_image_patches,
+)
 from .layers import (
     ClippedLinear,
+    K_MASK,
     RMSNorm,
     VisionRMSNorm,
     apply_multidim_rope,
@@ -18,6 +25,14 @@ from .layers import (
 
 
 POSITIONS_PAD_VALUE = -1
+
+
+def _looks_like_raw_image_tensor(tensor: torch.Tensor) -> bool:
+    return bool(
+        (tensor.ndim >= 4 and tensor.shape[-1] in {1, 3, 4})
+        or (tensor.ndim >= 4 and tensor.shape[-3] in {1, 3, 4})
+        or (tensor.ndim == 3 and tensor.shape[-1] in {1, 3, 4})
+    )
 
 
 def patchify_images(images: torch.Tensor, patch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,8 +106,7 @@ class Gemma4VisionPatchEmbed(nn.Module):
         nn.init.normal_(self.position_table, mean=0.0, std=config.position_init_std)
 
     def forward(self, patches: torch.Tensor, positions_xy: torch.Tensor) -> torch.Tensor:
-        hidden_states = 2.0 * (patches - 0.5)
-        hidden_states = self.input_proj(hidden_states)
+        hidden_states = self.input_proj(patches.to(dtype=self.input_proj.weight.dtype))
         return hidden_states + factorized_position_embeddings(
             self.position_table,
             positions_xy,
@@ -189,7 +203,7 @@ class Gemma4VisionAttention(nn.Module):
                 value = value.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
 
             attn_logits = torch.matmul(query, key.transpose(-1, -2))
-            attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], float("-inf"))
+            attn_logits = attn_logits.masked_fill(~attention_mask[:, None, :, :], K_MASK)
             attn_probs = F.softmax(attn_logits.float(), dim=-1).to(dtype=query.dtype)
             attn_output = torch.matmul(attn_probs, value)
 
@@ -278,24 +292,41 @@ class Gemma4VisionEncoder(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
+        self.image_processor = Gemma4ImageProcessor.from_config(config)
         self.patch_embed = Gemma4VisionPatchEmbed(config)
         self.layers = nn.ModuleList([Gemma4VisionBlock(config) for _ in range(config.num_layers)])
         self.pooler = Gemma4VisionPooler(config)
         self.standardize = Gemma4VisionStandardize(config.hidden_size) if config.standardize_embeddings else None
 
+    def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
+        """Convert raw images into padded patch tensors for the vision stack."""
+        return self.image_processor.preprocess(images)
+
+    def resolve_patch_inputs(
+            self,
+            patches_or_images: ImageBatchInput | torch.Tensor,
+            positions_xy: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve raw images or patch tensors into patch and position tensors."""
+        if positions_xy is None:
+            if not torch.is_tensor(patches_or_images) or _looks_like_raw_image_tensor(patches_or_images):
+                image_batch = self.preprocess_images(patches_or_images)
+                return image_batch.pixel_values, image_batch.image_position_ids
+            raise ValueError("positions_xy is required when passing patch tensors.")
+
+        return patches_or_images, positions_xy
+
     def forward(
             self,
-            patches_or_images: torch.Tensor,
+            patches_or_images: ImageBatchInput | torch.Tensor,
             positions_xy: torch.Tensor | None = None,
             output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        if patches_or_images.ndim >= 4 and patches_or_images.shape[-1] == 3:
-            patches, positions_xy = patchify_images(patches_or_images, self.config.patch_size)
-        else:
-            patches = patches_or_images
-            if positions_xy is None:
-                raise ValueError("positions_xy is required when passing patch tensors.")
+        patches, positions_xy = self.resolve_patch_inputs(patches_or_images, positions_xy)
 
+        patch_device = self.patch_embed.position_table.device
+        patches = normalize_image_patches(patches).to(device=patch_device)
+        positions_xy = positions_xy.to(device=patch_device)
         input_mask = ~(positions_xy == POSITIONS_PAD_VALUE).all(dim=-1)
         hidden_states = self.patch_embed(patches, positions_xy)
         attention_mask = input_mask[:, :, None] & input_mask[:, None, :]
@@ -325,41 +356,45 @@ class Gemma4VisionTower(nn.Module):
 
     def forward(
             self,
-            patches_or_images: torch.Tensor,
+            patches_or_images: ImageBatchInput | torch.Tensor,
             positions_xy: torch.Tensor | None = None,
             output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         return self.encoder(patches_or_images, positions_xy, output_length_overrides)
 
+    def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
+        """Convert raw images into padded patch tensors."""
+        return self.encoder.preprocess_images(images)
+
+    @staticmethod
+    def _flatten_image_groups(
+            patches: torch.Tensor,
+            positions_xy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int] | None]:
+        if patches.ndim == 5 or (patches.ndim == 4 and positions_xy.ndim == 4):
+            batch, num_images = patches.shape[:2]
+            return (
+                patches.view(batch * num_images, *patches.shape[2:]),
+                positions_xy.view(batch * num_images, *positions_xy.shape[2:]),
+                (batch, num_images),
+            )
+        return patches, positions_xy, None
+
     def encode_to_text(
             self,
-            patches_or_images: torch.Tensor,
+            patches_or_images: ImageBatchInput | torch.Tensor,
             positions_xy: torch.Tensor | None = None,
             output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        flatten_groups = False
-        if patches_or_images.ndim == 5 or (
-            patches_or_images.ndim == 4 and positions_xy is not None and positions_xy.ndim == 4
-        ):
-            batch, num_images = patches_or_images.shape[:2]
-            patches = patches_or_images.view(batch * num_images, *patches_or_images.shape[2:])
-            positions = (
-                positions_xy.view(batch * num_images, *positions_xy.shape[2:])
-                if positions_xy is not None
-                else None
-            )
-            flatten_groups = True
-        else:
-            batch = patches_or_images.shape[0]
-            num_images = 1
-            patches = patches_or_images
-            positions = positions_xy
+        patches, positions = self.encoder.resolve_patch_inputs(patches_or_images, positions_xy)
+        patches, positions, grouped_shape = self._flatten_image_groups(patches, positions)
 
         tokens, mask = self.encoder(patches, positions, output_length_overrides)[0]
         if self.to_text is not None:
             tokens = self.to_text(self.to_text_norm(tokens))
 
-        if flatten_groups:
+        if grouped_shape is not None:
+            batch, num_images = grouped_shape
             tokens = tokens.view(batch, num_images, tokens.shape[1], tokens.shape[2])
             mask = mask.view(batch, num_images, mask.shape[1])
             tokens = tokens.flatten(1, 2)

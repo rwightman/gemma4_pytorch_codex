@@ -25,7 +25,16 @@ from .convert import (
     restore_orbax_checkpoint,
 )
 from .audio import Gemma4AudioEncoder, Gemma4AudioTower
-from .model import Gemma4Model, Gemma4Output
+from .image_processing import (
+    Gemma4ImageBatch,
+    Gemma4ImageProcessor,
+    convert_image_to_patches,
+    get_target_dimensions,
+    normalize_image_patches,
+    pad_along_first_dim,
+)
+from .model import Gemma4Model, Gemma4Output, Gemma4PreparedInputs
+from .processing import Gemma4MultimodalBatch, Gemma4Processor, PromptImageInput
 from .text import Gemma4TextTower, LayerKVCache, TextKVCache
 from .tokenizer import Gemma4SpecialTokens, Gemma4Tokenizer
 from .vision import Gemma4VisionEncoder, Gemma4VisionTower, patchify_images
@@ -36,9 +45,14 @@ __all__ = [
     "AudioConfig",
     "Gemma4AudioEncoder",
     "Gemma4AudioTower",
+    "Gemma4ImageBatch",
+    "Gemma4ImageProcessor",
     "Gemma4Config",
     "Gemma4Model",
+    "Gemma4MultimodalBatch",
     "Gemma4Output",
+    "Gemma4PreparedInputs",
+    "Gemma4Processor",
     "Gemma4SpecialTokens",
     "Gemma4TextTower",
     "Gemma4Tokenizer",
@@ -52,17 +66,22 @@ __all__ = [
     "convert_hf_checkpoint",
     "convert_hf_state_dict_to_native",
     "convert_jax_tree_to_native",
+    "convert_image_to_patches",
     "convert_orbax_checkpoint",
     "gemma4_26b_a4b_config",
     "gemma4_31b_config",
     "gemma4_e2b_config",
     "gemma4_e4b_config",
+    "get_target_dimensions",
     "load_hf_config",
     "load_hf_state_dict",
     "make_attention_layer_types",
     "native_config_from_hf_dict",
     "native_config_from_hf_path",
+    "normalize_image_patches",
     "patchify_images",
+    "pad_along_first_dim",
+    "PromptImageInput",
     "resolve_variant_config",
     "restore_orbax_checkpoint",
 ]

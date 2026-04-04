@@ -35,8 +35,8 @@ def make_dense_multimodal_config(*, hf_audio_order: bool) -> Gemma4Config:
             per_layer_input_dim=4,
             sliding_window=8,
             pad_token_id=0,
-            image_placeholder_token_id=258_880,
-            audio_placeholder_token_id=258_881,
+            image_token_id=258_880,
+            audio_token_id=258_881,
             final_logit_softcap=30.0,
         ),
         vision=VisionConfig(
@@ -92,8 +92,8 @@ def make_moe_text_config() -> Gemma4Config:
             top_k_experts=2,
             moe_dense_hidden_size=12,
             final_logit_softcap=30.0,
-            image_placeholder_token_id=258_880,
-            audio_placeholder_token_id=258_881,
+            image_token_id=258_880,
+            audio_token_id=258_881,
         )
     )
 
@@ -190,8 +190,8 @@ def make_hf_config_dict(config: Gemma4Config, *, text_only: bool = False) -> dic
             "output_proj_dims": audio.output_size,
         },
         "vision_soft_tokens_per_image": vision.output_length,
-        "image_token_id": text.image_placeholder_token_id,
-        "audio_token_id": text.audio_placeholder_token_id,
+        "image_token_id": text.image_token_id,
+        "audio_token_id": text.audio_token_id,
     }
 
 
@@ -850,8 +850,10 @@ def test_hf_checkpoint_conversion_roundtrip(tmp_path: Path) -> None:
 
     assert converted_config.audio is not None
     assert converted_config.audio.projection_norm_before_text
-    assert converted_config.text.image_placeholder_token_id == 258_880
-    assert converted_config.text.audio_placeholder_token_id == 258_881
+    assert converted_config.text.image_token_id == 258_880
+    assert converted_config.text.audio_token_id == 258_881
+    assert converted_config.text.image_placeholder_token_id == -2
+    assert converted_config.text.audio_placeholder_token_id == -4
     assert_state_dicts_close(restored.state_dict(), model.state_dict())
 
 

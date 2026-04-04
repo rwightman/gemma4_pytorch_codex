@@ -444,8 +444,24 @@ class Gemma4TextTower(nn.Module):
     def weight(self) -> torch.Tensor:
         return self.token_embedding.weight
 
+    def _embedding_token_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Map input ids to the token embedding lookup domain.
+
+        Gemma4's original JAX multimodal path performs the initial token
+        embedding lookup on sequences that still contain internal negative
+        soft-token placeholders. JAX array indexing wraps those negative ids
+        from the end of the embedding table. We match that behavior here for
+        the main token embedding path only.
+        """
+        wrapped_ids = torch.where(
+            input_ids < 0,
+            input_ids.remainder(self.config.vocab_size),
+            input_ids,
+        )
+        return safe_token_ids(wrapped_ids, self.config.vocab_size)
+
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.token_embedding(safe_token_ids(input_ids, self.config.vocab_size))
+        return self.token_embedding(self._embedding_token_ids(input_ids))
 
     def project_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return F.linear(hidden_states, self.token_embedding.weight)

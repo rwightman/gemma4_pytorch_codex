@@ -12,11 +12,13 @@ from safetensors.torch import save_file as save_safetensors
 
 from .audio import Gemma4AudioTower
 from .config import Gemma4Config
+from .image_processing import Gemma4ImageBatch, ImageBatchInput
 from .layers import (
     build_positions_from_mask,
     make_causal_bidirectional_mask,
     merge_flat_embeddings,
 )
+from .processing import Gemma4Processor, PromptImageInput
 from .text import Gemma4TextTower, TextKVCache
 from .tokenizer import Gemma4Tokenizer
 from .vision import Gemma4VisionTower
@@ -32,6 +34,72 @@ class Gemma4Output:
     logits: torch.Tensor
     hidden_states: torch.Tensor | None = None
     kv_cache: TextKVCache | None = None
+
+
+@dataclass
+class Gemma4PreparedInputs:
+    """Prepared text and multimodal tensors ready for model forward or generation."""
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    vision_tokens: torch.Tensor | None = None
+    vision_token_mask: torch.Tensor | None = None
+    audio_tokens: torch.Tensor | None = None
+    audio_token_mask: torch.Tensor | None = None
+
+    def to(
+            self,
+            device: str | torch.device,
+            *,
+            dtype: torch.dtype | None = None,
+    ) -> "Gemma4PreparedInputs":
+        """Move prepared inputs to a target device and optional floating dtype."""
+        return Gemma4PreparedInputs(
+            input_ids=self.input_ids.to(device=device),
+            attention_mask=self.attention_mask.to(device=device),
+            vision_tokens=_move_optional_tensor(self.vision_tokens, device=device, dtype=dtype),
+            vision_token_mask=_move_optional_tensor(self.vision_token_mask, device=device),
+            audio_tokens=_move_optional_tensor(self.audio_tokens, device=device, dtype=dtype),
+            audio_token_mask=_move_optional_tensor(self.audio_token_mask, device=device),
+        )
+
+    def as_forward_kwargs(self) -> dict[str, torch.Tensor]:
+        """Return the non-empty tensors accepted by ``Gemma4Model.forward``."""
+        kwargs: dict[str, torch.Tensor] = {
+            "input_ids": self.input_ids,
+            "attention_mask": self.attention_mask,
+        }
+        if self.vision_tokens is not None:
+            kwargs["vision_tokens"] = self.vision_tokens
+        if self.vision_token_mask is not None:
+            kwargs["vision_token_mask"] = self.vision_token_mask
+        if self.audio_tokens is not None:
+            kwargs["audio_tokens"] = self.audio_tokens
+        if self.audio_token_mask is not None:
+            kwargs["audio_token_mask"] = self.audio_token_mask
+        return kwargs
+
+    def __getitem__(self, key: str) -> torch.Tensor | None:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def get(self, key: str, default: torch.Tensor | None = None) -> torch.Tensor | None:
+        return getattr(self, key, default)
+
+
+def _move_optional_tensor(
+        value: torch.Tensor | None,
+        *,
+        device: str | torch.device,
+        dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if dtype is not None and torch.is_floating_point(value):
+        return value.to(device=device, dtype=dtype)
+    return value.to(device=device)
 
 
 class Gemma4Model(nn.Module):
@@ -52,9 +120,64 @@ class Gemma4Model(nn.Module):
             else None
         )
 
+    def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
+        """Convert raw images into padded patch tensors for the vision tower."""
+        if self.vision is None:
+            raise ValueError("This model was instantiated without a vision tower.")
+        return self.vision.preprocess_images(images)
+
+    def build_processor(self, tokenizer: Gemma4Tokenizer) -> Gemma4Processor:
+        """Create a tokenizer+image processor wrapper for multimodal prompts."""
+        return Gemma4Processor(
+            tokenizer=tokenizer,
+            text_config=self.config.text,
+            image_processor=None if self.vision is None else self.vision.encoder.image_processor,
+        )
+
+    def prepare_inputs(
+            self,
+            tokenizer: Gemma4Tokenizer,
+            prompt: str | list[str],
+            *,
+            images: PromptImageInput = None,
+            add_bos: bool = True,
+            add_eos: bool = False,
+            padding: bool = True,
+    ) -> Gemma4PreparedInputs:
+        """Prepare token ids, masks, and optional vision tokens for a prompt batch."""
+        processor = self.build_processor(tokenizer)
+        batch = processor(
+            prompt,
+            images=images,
+            add_bos=add_bos,
+            add_eos=add_eos,
+            padding=padding,
+        )
+        device = next(self.parameters()).device
+        batch = batch.to(device)
+        prepared = Gemma4PreparedInputs(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+        )
+        if batch.image_batch is None:
+            return prepared
+        if self.vision is None:
+            raise ValueError("This model was instantiated without a vision tower.")
+
+        vision_tokens, vision_token_mask = self.encode_images_to_text(
+            batch.image_batch.pixel_values,
+            batch.image_batch.image_position_ids,
+        )
+        return Gemma4PreparedInputs(
+            input_ids=prepared.input_ids,
+            attention_mask=prepared.attention_mask,
+            vision_tokens=vision_tokens,
+            vision_token_mask=vision_token_mask,
+        )
+
     def encode_images_to_text(
             self,
-            patches_or_images: torch.Tensor,
+            patches_or_images: ImageBatchInput | torch.Tensor,
             positions_xy: torch.Tensor | None = None,
             output_length_overrides: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -315,35 +438,57 @@ class Gemma4Model(nn.Module):
             tokenizer: Gemma4Tokenizer,
             prompt: str | list[str],
             *,
+            images: PromptImageInput = None,
             add_bos: bool = True,
+            add_eos: bool = False,
             return_full_text: bool = False,
             skip_special_tokens: bool = True,
             **generate_kwargs,
     ) -> str | list[str]:
         """Tokenize a prompt, run generation, and decode the result."""
-        batch = tokenizer(
+        batch = self.prepare_inputs(
+            tokenizer,
             prompt,
+            images=images,
             add_bos=add_bos,
+            add_eos=add_eos,
             padding=True,
-            return_tensors="pt",
         )
-        device = next(self.parameters()).device
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        input_ids = batch.input_ids
+        attention_mask = batch.attention_mask
         eos_token_id = generate_kwargs.pop("eos_token_id", tokenizer.eos_token_id)
         generated = self.generate(
             input_ids,
             attention_mask=attention_mask,
+            vision_tokens=batch.vision_tokens,
+            vision_token_mask=batch.vision_token_mask,
             eos_token_id=eos_token_id,
             **generate_kwargs,
         )
 
         if return_full_text:
-            decoded = tokenizer.batch_decode(generated, skip_special_tokens=skip_special_tokens)
+            decoded = self._decode_output_sequences(
+                tokenizer,
+                generated,
+                skip_special_tokens=skip_special_tokens,
+            )
         else:
             continuation = generated[:, input_ids.shape[1] :]
             decoded = tokenizer.batch_decode(continuation, skip_special_tokens=skip_special_tokens)
         return decoded[0] if isinstance(prompt, str) else decoded
+
+    @staticmethod
+    def _decode_output_sequences(
+            tokenizer: Gemma4Tokenizer,
+            token_ids: torch.Tensor,
+            *,
+            skip_special_tokens: bool,
+    ) -> list[str]:
+        decoded: list[str] = []
+        for row in token_ids.detach().cpu().tolist():
+            filtered = [int(token_id) for token_id in row if int(token_id) >= 0]
+            decoded.append(tokenizer.decode(filtered, skip_special_tokens=skip_special_tokens))
+        return decoded
 
     def save_pretrained(
             self,

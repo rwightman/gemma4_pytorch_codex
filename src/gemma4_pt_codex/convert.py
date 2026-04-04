@@ -119,8 +119,8 @@ def native_config_from_hf_dict(config_dict: Mapping[str, Any]) -> Gemma4Config:
 
     text_config = _native_text_config_from_hf(
         text_data,
-        image_placeholder_token_id=image_token_id,
-        audio_placeholder_token_id=audio_token_id,
+        image_token_id=image_token_id,
+        audio_token_id=audio_token_id,
     )
     vision_config = None if vision_data is None else _native_vision_config_from_hf(vision_data, config_dict)
     audio_config = None if audio_data is None else _native_audio_config_from_hf(audio_data)
@@ -424,8 +424,8 @@ def main(argv: list[str] | None = None) -> int:
 def _native_text_config_from_hf(
         text_data: Mapping[str, Any],
         *,
-        image_placeholder_token_id: int,
-        audio_placeholder_token_id: int,
+        image_token_id: int,
+        audio_token_id: int,
 ) -> TextConfig:
     num_layers = int(text_data["num_hidden_layers"])
     num_kv_shared_layers = int(text_data.get("num_kv_shared_layers", 0) or 0)
@@ -472,8 +472,8 @@ def _native_text_config_from_hf(
         top_k_experts=int(text_data.get("top_k_experts", 0) or 0),
         moe_dense_hidden_size=intermediate_size if enable_moe else 0,
         pad_token_id=int(text_data.get("pad_token_id", 0) or 0),
-        image_placeholder_token_id=image_placeholder_token_id,
-        audio_placeholder_token_id=audio_placeholder_token_id,
+        image_token_id=image_token_id,
+        audio_token_id=audio_token_id,
         rms_norm_eps=float(text_data.get("rms_norm_eps", 1e-6)),
     )
 
