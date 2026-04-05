@@ -11,6 +11,7 @@ from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
 from .audio import Gemma4AudioTower
+from .audio_processing import AudioBatchInput, Gemma4AudioBatch, Gemma4AudioProcessor
 from .config import Gemma4Config
 from .image_processing import Gemma4ImageBatch, ImageBatchInput
 from .layers import (
@@ -18,7 +19,7 @@ from .layers import (
     make_causal_bidirectional_mask,
     merge_flat_embeddings,
 )
-from .processing import Gemma4Processor, PromptImageInput
+from .processing import Gemma4Processor, PromptAudioInput, PromptImageInput
 from .text import Gemma4TextTower, TextKVCache
 from .tokenizer import Gemma4Tokenizer
 from .vision import Gemma4VisionTower
@@ -102,6 +103,27 @@ def _move_optional_tensor(
     return value.to(device=device)
 
 
+def _build_audio_token_mask(
+        num_soft_tokens_per_clip: torch.Tensor,
+        total_audio_tokens: int,
+) -> torch.Tensor:
+    counts = num_soft_tokens_per_clip.to(dtype=torch.long)
+    if counts.ndim == 1:
+        counts = counts.unsqueeze(1)
+
+    batch, num_clips = counts.shape
+    if num_clips == 0:
+        return torch.zeros(batch, total_audio_tokens, dtype=torch.bool, device=counts.device)
+
+    tokens_per_clip = total_audio_tokens // num_clips
+    mask = torch.zeros(batch, total_audio_tokens, dtype=torch.bool, device=counts.device)
+    for clip_idx in range(num_clips):
+        start = clip_idx * tokens_per_clip
+        positions = torch.arange(tokens_per_clip, device=counts.device)
+        mask[:, start : start + tokens_per_clip] = positions.unsqueeze(0) < counts[:, clip_idx : clip_idx + 1]
+    return mask
+
+
 class Gemma4Model(nn.Module):
     """Top-level Gemma 4 multimodal model."""
 
@@ -126,12 +148,19 @@ class Gemma4Model(nn.Module):
             raise ValueError("This model was instantiated without a vision tower.")
         return self.vision.preprocess_images(images)
 
+    def preprocess_audios(self, audios: AudioBatchInput) -> Gemma4AudioBatch:
+        """Convert raw audio inputs into padded log-mel features for the audio tower."""
+        if self.audio is None:
+            raise ValueError("This model was instantiated without an audio tower.")
+        return Gemma4AudioProcessor.from_config(self.config.audio).preprocess(audios)
+
     def build_processor(self, tokenizer: Gemma4Tokenizer) -> Gemma4Processor:
         """Create a tokenizer+image processor wrapper for multimodal prompts."""
         return Gemma4Processor(
             tokenizer=tokenizer,
             text_config=self.config.text,
             image_processor=None if self.vision is None else self.vision.encoder.image_processor,
+            audio_processor=None if self.audio is None else Gemma4AudioProcessor.from_config(self.config.audio),
         )
 
     def prepare_inputs(
@@ -140,6 +169,7 @@ class Gemma4Model(nn.Module):
             prompt: str | list[str],
             *,
             images: PromptImageInput = None,
+            audios: PromptAudioInput = None,
             add_bos: bool = True,
             add_eos: bool = False,
             padding: bool = True,
@@ -149,6 +179,7 @@ class Gemma4Model(nn.Module):
         batch = processor(
             prompt,
             images=images,
+            audios=audios,
             add_bos=add_bos,
             add_eos=add_eos,
             padding=padding,
@@ -159,20 +190,40 @@ class Gemma4Model(nn.Module):
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
         )
-        if batch.image_batch is None:
+        if batch.image_batch is None and batch.audio_batch is None:
             return prepared
-        if self.vision is None:
-            raise ValueError("This model was instantiated without a vision tower.")
+        vision_tokens = None
+        vision_token_mask = None
+        audio_tokens = None
+        audio_token_mask = None
 
-        vision_tokens, vision_token_mask = self.encode_images_to_text(
-            batch.image_batch.pixel_values,
-            batch.image_batch.image_position_ids,
-        )
+        if batch.image_batch is not None:
+            if self.vision is None:
+                raise ValueError("This model was instantiated without a vision tower.")
+            vision_tokens, vision_token_mask = self.encode_images_to_text(
+                batch.image_batch.pixel_values,
+                batch.image_batch.image_position_ids,
+            )
+
+        if batch.audio_batch is not None:
+            if self.audio is None:
+                raise ValueError("This model was instantiated without an audio tower.")
+            audio_tokens, audio_token_mask = self.encode_audio_to_text(
+                batch.audio_batch.input_features,
+                batch.audio_batch.input_features_mask,
+            )
+            audio_token_mask = audio_token_mask & _build_audio_token_mask(
+                batch.audio_batch.num_soft_tokens_per_clip,
+                audio_tokens.shape[1],
+            )
+
         return Gemma4PreparedInputs(
             input_ids=prepared.input_ids,
             attention_mask=prepared.attention_mask,
             vision_tokens=vision_tokens,
             vision_token_mask=vision_token_mask,
+            audio_tokens=audio_tokens,
+            audio_token_mask=audio_token_mask,
         )
 
     def encode_images_to_text(
@@ -439,6 +490,7 @@ class Gemma4Model(nn.Module):
             prompt: str | list[str],
             *,
             images: PromptImageInput = None,
+            audios: PromptAudioInput = None,
             add_bos: bool = True,
             add_eos: bool = False,
             return_full_text: bool = False,
@@ -450,6 +502,7 @@ class Gemma4Model(nn.Module):
             tokenizer,
             prompt,
             images=images,
+            audios=audios,
             add_bos=add_bos,
             add_eos=add_eos,
             padding=True,
@@ -462,6 +515,8 @@ class Gemma4Model(nn.Module):
             attention_mask=attention_mask,
             vision_tokens=batch.vision_tokens,
             vision_token_mask=batch.vision_token_mask,
+            audio_tokens=batch.audio_tokens,
+            audio_token_mask=batch.audio_token_mask,
             eos_token_id=eos_token_id,
             **generate_kwargs,
         )

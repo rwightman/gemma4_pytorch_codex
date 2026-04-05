@@ -25,6 +25,7 @@ from .convert import (
     restore_orbax_checkpoint,
 )
 from .audio import Gemma4AudioEncoder, Gemma4AudioTower
+from .audio_processing import AudioBatchInput, Gemma4AudioBatch, Gemma4AudioProcessor
 from .image_processing import (
     Gemma4ImageBatch,
     Gemma4ImageProcessor,
@@ -34,7 +35,7 @@ from .image_processing import (
     pad_along_first_dim,
 )
 from .model import Gemma4Model, Gemma4Output, Gemma4PreparedInputs
-from .processing import Gemma4MultimodalBatch, Gemma4Processor, PromptImageInput
+from .processing import Gemma4MultimodalBatch, Gemma4Processor, PromptAudioInput, PromptImageInput
 from .text import Gemma4TextTower, LayerKVCache, TextKVCache
 from .tokenizer import Gemma4SpecialTokens, Gemma4Tokenizer
 from .vision import Gemma4VisionEncoder, Gemma4VisionTower, patchify_images
@@ -43,7 +44,10 @@ __all__ = [
     "AttentionKind",
     "AttentionImpl",
     "AudioConfig",
+    "AudioBatchInput",
+    "Gemma4AudioBatch",
     "Gemma4AudioEncoder",
+    "Gemma4AudioProcessor",
     "Gemma4AudioTower",
     "Gemma4ImageBatch",
     "Gemma4ImageProcessor",
@@ -82,6 +86,7 @@ __all__ = [
     "patchify_images",
     "pad_along_first_dim",
     "PromptImageInput",
+    "PromptAudioInput",
     "resolve_variant_config",
     "restore_orbax_checkpoint",
 ]

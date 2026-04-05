@@ -11,6 +11,7 @@ license = {text = "Apache-2.0"}
 dependencies = [
     "numpy",
     "torch>=2.1",
+    "torchaudio>=2.1",
     "torchvision>=0.16",
     "sentencepiece",
     "tokenizers",
