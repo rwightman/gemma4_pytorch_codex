@@ -209,6 +209,18 @@ def test_audio_tower_shapes() -> None:
     assert mask.any()
 
 
+def test_audio_tower_bfloat16_shapes() -> None:
+    audio = make_tiny_audio_config()
+    model = Gemma4Model(Gemma4Config(text=make_tiny_text_config(), audio=audio)).to(dtype=torch.bfloat16)
+    features = torch.randn(2, 20, audio.num_mel_bins, dtype=torch.bfloat16)
+    feature_mask = torch.ones(2, 20, dtype=torch.bool)
+    tokens, mask = model.encode_audio_to_text(features, feature_mask)
+    assert tokens.ndim == 3
+    assert mask.shape[:2] == tokens.shape[:2]
+    assert tokens.dtype == torch.bfloat16
+    assert mask.any()
+
+
 def test_multimodal_placeholder_merge() -> None:
     config = Gemma4Config(
         text=make_tiny_text_config(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import types
 import wave
 
 import sentencepiece as spm
@@ -128,6 +129,45 @@ def test_prepare_inputs_expands_audio_into_internal_soft_tokens(tmp_path: Path) 
     assert batch.audio_token_mask is not None
     assert int(placeholder_mask.sum()) == int(batch.audio_token_mask.sum())
     assert batch.audio_tokens.shape[-1] == model.config.text.hidden_size
+
+
+def test_prepare_inputs_casts_audio_features_to_model_dtype(tmp_path: Path) -> None:
+    tokenizer = Gemma4Tokenizer(train_tiny_sentencepiece_model(tmp_path))
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            audio=make_tiny_audio_config(),
+        )
+    ).to(dtype=torch.bfloat16)
+
+    seen: dict[str, torch.dtype] = {}
+
+    def fake_encode_audio_to_text(
+            self: Gemma4Model,
+            features: torch.Tensor,
+            feature_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seen["dtype"] = features.dtype
+        tokens = torch.zeros(
+            features.shape[0],
+            1,
+            self.config.text.hidden_size,
+            dtype=self.text.token_embedding.weight.dtype,
+            device=features.device,
+        )
+        mask = torch.ones(features.shape[0], 1, dtype=torch.bool, device=features.device)
+        return tokens, mask
+
+    model.encode_audio_to_text = types.MethodType(fake_encode_audio_to_text, model)
+
+    batch = model.prepare_inputs(
+        tokenizer,
+        "hello <|audio|> world",
+        audios=make_waveform(),
+    )
+
+    assert seen["dtype"] == torch.bfloat16
+    assert batch.audio_tokens is not None
 
 
 def test_generate_text_accepts_audio(tmp_path: Path) -> None:

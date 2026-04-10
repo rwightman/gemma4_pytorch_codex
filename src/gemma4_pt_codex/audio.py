@@ -181,7 +181,8 @@ class Gemma4AudioRelativePosition(nn.Module):
         scaled_time = positions[:, :, None].float() * inv_timescales[None, None, :]
         sin_emb = torch.cat([scaled_time.sin(), scaled_time.cos()], dim=-1)
         pos_length = sin_emb.shape[1]
-        sin_emb = self.pos_proj(sin_emb).view(1, pos_length, num_heads, head_dim).squeeze(0)
+        sin_emb = self.pos_proj(sin_emb.to(dtype=self.pos_proj.weight.dtype)).float()
+        sin_emb = sin_emb.view(1, pos_length, num_heads, head_dim).squeeze(0)
         sin_emb = sin_emb.permute(1, 2, 0)
 
         term_bd = torch.matmul(
@@ -274,6 +275,7 @@ class Gemma4AudioAttentionBlock(nn.Module):
         x = x.clamp(-self.gradient_clipping, self.gradient_clipping)
         x = self.pre_norm(x)
         x = self.attn(x, mask).reshape(x.shape[0], x.shape[1], -1)
+        x = x.to(dtype=self.post.weight.dtype)
         x = self.post(x)
         x = x.clamp(-self.gradient_clipping, self.gradient_clipping)
         x = self.post_norm(x)

@@ -184,8 +184,16 @@ class Gemma4Model(nn.Module):
             add_eos=add_eos,
             padding=padding,
         )
-        device = next(self.parameters()).device
+        model_param = next(self.parameters())
+        device = model_param.device
+        model_dtype = model_param.dtype
         batch = batch.to(device)
+        if batch.audio_batch is not None and batch.audio_batch.input_features.dtype != model_dtype:
+            batch.audio_batch = Gemma4AudioBatch(
+                input_features=batch.audio_batch.input_features.to(device=device, dtype=model_dtype),
+                input_features_mask=batch.audio_batch.input_features_mask,
+                num_soft_tokens_per_clip=batch.audio_batch.num_soft_tokens_per_clip,
+            )
         prepared = Gemma4PreparedInputs(
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
