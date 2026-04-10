@@ -10,6 +10,7 @@ from gemma4_pt_codex import (
     VisionConfig,
     get_target_dimensions,
 )
+from gemma4_pt_codex.vision import avg_pool_by_positions
 
 
 def make_tiny_text_config() -> TextConfig:
@@ -132,3 +133,17 @@ def test_vision_encoder_resolve_patch_inputs_matches_preprocess() -> None:
 
     torch.testing.assert_close(resolved_patches, image_batch.pixel_values, atol=1e-6, rtol=1e-6)
     assert torch.equal(resolved_positions, image_batch.image_position_ids)
+
+
+def test_avg_pool_by_positions_accepts_bfloat16_inputs() -> None:
+    x = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    positions = torch.tensor(
+        [[[0, 0], [1, 0], [0, 1], [1, 1]]],
+        dtype=torch.long,
+    )
+
+    pooled, mask = avg_pool_by_positions(x, positions, 1)
+
+    assert pooled.dtype == torch.bfloat16
+    assert mask.dtype == torch.bool
+    assert pooled.shape == (1, 1, 8)

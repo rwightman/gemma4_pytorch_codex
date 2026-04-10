@@ -84,7 +84,7 @@ def avg_pool_by_positions(
     max_x = safe_positions[..., 0].amax(dim=-1, keepdim=True) + 1
     kernel_indices = torch.div(safe_positions, k, rounding_mode="floor")
     flat_kernel_indices = kernel_indices[..., 0] + (max_x // k) * kernel_indices[..., 1]
-    weights = F.one_hot(flat_kernel_indices.long(), num_classes=length).to(dtype=x.dtype) / (k**2)
+    weights = F.one_hot(flat_kernel_indices.long(), num_classes=length).to(dtype=torch.float32) / (k**2)
     weights = weights.masked_fill(padding_positions.unsqueeze(-1), 0.0)
     output = torch.matmul(weights.transpose(1, 2), x.float()).to(dtype=x.dtype)
     mask = ~(weights == 0).all(dim=1)
