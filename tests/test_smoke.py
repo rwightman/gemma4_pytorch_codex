@@ -305,6 +305,43 @@ def test_from_pretrained_attn_impl_override(tmp_path: Path) -> None:
     assert generated.shape == (1, 6)
 
 
+def test_init_non_persistent_buffers_recurses_into_audio() -> None:
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            audio=make_tiny_audio_config(),
+        )
+    )
+    audio_attn = model.audio.encoder.layers[0].attn.attn
+    audio_attn.causal_valid_mask = torch.zeros_like(audio_attn.causal_valid_mask)
+
+    model.init_non_persistent_buffers()
+
+    assert audio_attn.causal_valid_mask.any()
+    assert audio_attn.causal_valid_mask.shape == (
+        model.config.audio.chunk_size,
+        model.config.audio.chunk_size + max(0, model.config.audio.left_context - 1) + model.config.audio.right_context,
+    )
+
+
+def test_from_pretrained_rebuilds_audio_non_persistent_buffers(tmp_path: Path) -> None:
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            audio=make_tiny_audio_config(),
+        )
+    )
+    save_dir = tmp_path / "audio_reload"
+    model.save_pretrained(save_dir)
+
+    reloaded = Gemma4Model.from_pretrained(save_dir, dtype=torch.bfloat16)
+    audio_attn = reloaded.audio.encoder.layers[0].attn.attn
+
+    assert audio_attn.causal_valid_mask.dtype == torch.bool
+    assert not audio_attn.causal_valid_mask.is_meta
+    assert reloaded.audio.to_text.weight.dtype == torch.bfloat16
+
+
 def _train_tiny_sentencepiece_model(tmp_path: Path) -> Path:
     corpus_path = tmp_path / "corpus.txt"
     corpus_path.write_text(

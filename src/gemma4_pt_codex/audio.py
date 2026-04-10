@@ -213,9 +213,15 @@ class Gemma4AudioLocalAttention(nn.Module):
         self.key_scale = math.log1p(math.e) / math.log(2.0)
         self.register_buffer(
             "causal_valid_mask",
-            _causal_valid_mask(config, device=torch.device("cpu")),
+            self._build_causal_valid_mask(),
             persistent=False,
         )
+
+    def _build_causal_valid_mask(self) -> torch.Tensor:
+        return _causal_valid_mask(self.config, device=self.per_dim_scale.device)
+
+    def init_non_persistent_buffers(self) -> None:
+        self.causal_valid_mask = self._build_causal_valid_mask()
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape

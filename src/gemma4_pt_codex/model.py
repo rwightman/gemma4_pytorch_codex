@@ -30,6 +30,17 @@ SAFE_WEIGHTS_NAME = "model.safetensors"
 TORCH_WEIGHTS_NAME = "pytorch_model.bin"
 
 
+def _run_non_persistent_buffer_init(module: nn.Module) -> None:
+    """Rebuild runtime-only buffers on child modules that opt into it."""
+    for submodule in module.modules():
+        if submodule is module:
+            continue
+        init_method = type(submodule).__dict__.get("init_non_persistent_buffers")
+        if init_method is None:
+            continue
+        init_method(submodule)
+
+
 @dataclass
 class Gemma4Output:
     logits: torch.Tensor
@@ -141,6 +152,10 @@ class Gemma4Model(nn.Module):
             if config.audio is not None
             else None
         )
+
+    def init_non_persistent_buffers(self) -> None:
+        """Rebuild runtime-only buffers after meta-init or state-dict assignment."""
+        _run_non_persistent_buffer_init(self)
 
     def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
         """Convert raw images into padded patch tensors for the vision tower."""
@@ -632,17 +647,16 @@ class Gemma4Model(nn.Module):
                 config.vision.attn_impl = attn_impl
                 config.vision.__post_init__()
 
-        model = cls(config)
         safe_path = load_directory / SAFE_WEIGHTS_NAME
         torch_path = load_directory / TORCH_WEIGHTS_NAME
         if safe_path.exists():
             try:
-                state_dict = load_safetensors(str(safe_path), device=str(device))
+                state_dict = load_safetensors(str(safe_path), device="cpu")
             except (OSError, RuntimeError) as exc:
                 raise RuntimeError(f"Failed to load safetensors weights from {safe_path}.") from exc
         elif torch_path.exists():
             try:
-                state_dict = torch.load(torch_path, map_location=device, weights_only=True)
+                state_dict = torch.load(torch_path, map_location="cpu", weights_only=True)
             except (OSError, RuntimeError, pickle.UnpicklingError) as exc:
                 raise RuntimeError(f"Failed to load PyTorch weights from {torch_path}.") from exc
         else:
@@ -650,12 +664,27 @@ class Gemma4Model(nn.Module):
                 f"Could not find {SAFE_WEIGHTS_NAME} or {TORCH_WEIGHTS_NAME} in {load_directory}."
             )
 
+        target_device = torch.device(device)
+        with torch.device("meta"):
+            model = cls(config)
+        if dtype is not None:
+            model = model.to(dtype=dtype)
+
+        assign = target_device.type == "cpu"
+        if assign:
+            if dtype is not None:
+                state_dict = {
+                    key: value.to(dtype=dtype) if torch.is_floating_point(value) else value
+                    for key, value in state_dict.items()
+                }
+        else:
+            model.to_empty(device=target_device)
+            model.init_non_persistent_buffers()
+
         try:
-            model.load_state_dict(state_dict, strict=strict)
+            model.load_state_dict(state_dict, strict=strict, assign=assign)
         except RuntimeError as exc:
             raise RuntimeError(f"Failed to load model weights into {type(model).__name__}.") from exc
 
-        model.to(device=device)
-        if dtype is not None:
-            model.to(dtype=dtype)
+        model.init_non_persistent_buffers()
         return model
