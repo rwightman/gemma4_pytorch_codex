@@ -251,7 +251,7 @@ class Gemma4AudioRelativePosition(InitModule):
         )
 
     def _init_weights(self, ctx: InitContext) -> None:
-        nn.init.xavier_uniform_(self.pos_proj.weight)
+        nn.init.xavier_uniform_(self.pos_proj.weight, generator=ctx.generator)
 
     def forward(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         batch, num_blocks, block_size, num_heads, head_dim = queries.shape

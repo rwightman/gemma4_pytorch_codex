@@ -12,6 +12,7 @@ from .config import (
     gemma4_e4b_config,
     make_attention_layer_types,
 )
+from .module_utils import InitContext
 from .convert import (
     convert_hf_checkpoint,
     convert_hf_state_dict_to_native,
@@ -52,6 +53,7 @@ __all__ = [
     "Gemma4ImageBatch",
     "Gemma4ImageProcessor",
     "Gemma4Config",
+    "InitContext",
     "Gemma4Model",
     "Gemma4MultimodalBatch",
     "Gemma4Output",

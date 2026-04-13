@@ -18,6 +18,7 @@ from gemma4_pt_codex.config import (
     VisionConfig,
 )
 from gemma4_pt_codex.model import Gemma4Model, Gemma4PreparedInputs
+from gemma4_pt_codex.module_utils import InitContext
 from gemma4_pt_codex.processing import Gemma4Processor
 from gemma4_pt_codex.text import Gemma4TextTower
 from gemma4_pt_codex.tokenizer import Gemma4Tokenizer
@@ -376,6 +377,23 @@ def test_from_pretrained_rebuilds_audio_non_persistent_buffers(tmp_path: Path) -
     assert reloaded.audio.to_text.weight.dtype == torch.bfloat16
 
 
+def test_constructor_init_context_matches_explicit_reinit() -> None:
+    config = Gemma4Config(text=make_tiny_text_config(), audio=make_tiny_audio_config())
+    model_from_ctor = Gemma4Model(
+        config,
+        init_context=InitContext(generator=torch.Generator(device="cpu").manual_seed(0)),
+    )
+    model_manual = Gemma4Model(config)
+    model_manual.init_weights(InitContext(generator=torch.Generator(device="cpu").manual_seed(0)))
+
+    for key, value in model_from_ctor.state_dict().items():
+        other = model_manual.state_dict()[key]
+        if torch.is_floating_point(value):
+            torch.testing.assert_close(value, other)
+        else:
+            assert torch.equal(value, other)
+
+
 def test_materialize_initializes_meta_model_and_runtime_buffers() -> None:
     with torch.device("meta"):
         model = Gemma4Model(
@@ -392,6 +410,30 @@ def test_materialize_initializes_meta_model_and_runtime_buffers() -> None:
     assert next(model.parameters()).dtype == torch.float32
     assert audio_attn.causal_valid_mask.dtype == torch.bool
     assert not audio_attn.causal_valid_mask.is_meta
+
+
+def test_materialize_init_context_matches_manual_meta_init() -> None:
+    config = Gemma4Config(text=make_tiny_text_config(), audio=make_tiny_audio_config())
+    with torch.device("meta"):
+        from_materialize = Gemma4Model(config)
+    from_materialize.materialize(
+        device="cpu",
+        dtype=torch.float32,
+        init_weights=True,
+        init_context=InitContext(generator=torch.Generator(device="cpu").manual_seed(0)),
+    )
+
+    with torch.device("meta"):
+        manual = Gemma4Model(config)
+    manual.materialize(device="cpu", dtype=torch.float32, init_weights=False)
+    manual.init_weights(InitContext(generator=torch.Generator(device="cpu").manual_seed(0)))
+
+    for key, value in from_materialize.state_dict().items():
+        other = manual.state_dict()[key]
+        if torch.is_floating_point(value):
+            torch.testing.assert_close(value, other)
+        else:
+            assert torch.equal(value, other)
 
 
 def _train_tiny_sentencepiece_model(tmp_path: Path) -> Path:
