@@ -93,8 +93,13 @@ model = gemma4.Gemma4Model.from_pretrained(
     "/path/to/checkpoint_dir",
     dtype=torch.bfloat16,
 )
-model.eval()
 ```
+
+Practical note:
+
+- `Gemma4Model.from_pretrained(...)` already uses meta-device materialization internally
+- `Gemma4Model.from_pretrained(...)` also returns the model in `eval()` mode
+- direct `Gemma4Model(config)` construction is for a fresh initialized model, not checkpoint loading
 
 If you want a different attention backend at load time:
 
@@ -121,7 +126,6 @@ import gemma4_pt_codex as gemma4
 
 tokenizer = gemma4.Gemma4Tokenizer.from_pretrained("/path/to/checkpoint_dir")
 model = gemma4.Gemma4Model.from_pretrained("/path/to/checkpoint_dir")
-model.eval()
 
 text = model.generate_text(
     tokenizer,

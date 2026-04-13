@@ -305,6 +305,7 @@ def test_from_pretrained_attn_impl_override(tmp_path: Path) -> None:
 
     reloaded = Gemma4Model.from_pretrained(save_dir, attn_impl="sdpa")
     assert reloaded.config.text.attn_impl == "sdpa"
+    assert reloaded.training is False
 
     prompt = torch.tensor([[1, 2, 3, 4]])
     generated = reloaded.generate(prompt, max_new_tokens=2, do_sample=False)

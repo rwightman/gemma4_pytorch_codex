@@ -733,4 +733,5 @@ class Gemma4Model(InitModule):
             raise RuntimeError(f"Failed to load model weights into {type(model).__name__}.") from exc
 
         model.init_non_persistent_buffers()
+        model.eval()
         return model
