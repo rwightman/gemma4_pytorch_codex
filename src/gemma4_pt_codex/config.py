@@ -97,6 +97,8 @@ class TextConfig:
     audio_placeholder_token_id: int = -4
     rms_norm_eps: float = 1e-6
     init_std: float = 1e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
     attn_impl: AttentionImpl = "eager"
 
     def __post_init__(self) -> None:
@@ -137,6 +139,8 @@ class VisionConfig:
     rms_norm_eps: float = 1e-6
     init_std: float = 1e-2
     position_init_std: float = 2e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
     projection_norm_eps: float = 1e-6
     attn_impl: AttentionImpl = "eager"
 
@@ -182,6 +186,8 @@ class AudioConfig:
     mel_floor: float = 1e-3
     rms_norm_eps: float = 1e-6
     init_std: float = 1e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
     feature_init_std: float = 1e-2
     projection_norm_before_text: bool = False
 

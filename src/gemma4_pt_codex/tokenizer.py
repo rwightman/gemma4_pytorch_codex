@@ -52,10 +52,11 @@ class Gemma4Tokenizer:
 
     def __init__(self, tokenizer_file: str | Path) -> None:
         self.tokenizer_file = Path(tokenizer_file)
-        self.model_file = self.tokenizer_file
         self.special_tokens = Gemma4SpecialTokens()
         self.sp_model: spm.SentencePieceProcessor | None = None
         self.fast_tokenizer: FastTokenizer | None = None
+        self.tokenizer_file = self._resolve_tokenizer_file(self.tokenizer_file)
+        self.model_file = self.tokenizer_file
 
         if self.tokenizer_file.suffix == ".json":
             try:
@@ -76,19 +77,10 @@ class Gemma4Tokenizer:
 
         self.backend = "sentencepiece"
 
-    @classmethod
-    def from_pretrained(
-            cls,
-            path: str | Path,
-    ) -> "Gemma4Tokenizer":
-        """Load a tokenizer from a file or tokenizer directory.
-
-        Args:
-            path: Tokenizer file or directory containing tokenizer assets.
-        """
-        path = Path(path)
+    @staticmethod
+    def _resolve_tokenizer_file(path: Path) -> Path:
         if path.is_file():
-            return cls(path)
+            return path
 
         config_path = path / TOKENIZER_CONFIG_NAME
         if config_path.exists():
@@ -106,7 +98,7 @@ class Gemma4Tokenizer:
                     continue
                 token_path = path / str(token_name)
                 if token_path.exists():
-                    return cls(token_path)
+                    return token_path
 
         for candidate in (
             path / TOKENIZER_MODEL_NAME,
@@ -115,16 +107,28 @@ class Gemma4Tokenizer:
             path / "tokenizer.spm",
         ):
             if candidate.exists():
-                return cls(candidate)
+                return candidate
 
         model_files = sorted(path.glob("*.model"))
         if model_files:
-            return cls(model_files[0])
+            return model_files[0]
         json_files = sorted(path.glob("*.json"))
         for candidate in json_files:
             if candidate.name in {TOKENIZER_JSON_NAME, "tokenizer_fast.json"}:
-                return cls(candidate)
+                return candidate
         raise FileNotFoundError(f"Could not find a tokenizer asset in {path}.")
+
+    @classmethod
+    def from_pretrained(
+            cls,
+            path: str | Path,
+    ) -> "Gemma4Tokenizer":
+        """Load a tokenizer from a file or tokenizer directory.
+
+        Args:
+            path: Tokenizer file or directory containing tokenizer assets.
+        """
+        return cls(cls._resolve_tokenizer_file(Path(path)))
 
     def save_pretrained(
             self,

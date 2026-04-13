@@ -11,14 +11,13 @@ from .config import AttentionKind, TextConfig, create_kv_sharing_patterns
 from .layers import (
     K_MASK,
     RMSNorm,
-    ScaledEmbedding,
     apply_text_rope,
     create_sliding_mask,
     gelu_tanh,
-    init_linear_module,
     repeat_kv,
     safe_token_ids,
 )
+from .module_utils import InitContext, InitModule, factory_kwargs, resolve_residual_init_std
 
 
 @dataclass
@@ -58,8 +57,20 @@ class TextKVCache:
         return first.mask
 
 
-def _make_linear(in_features: int, out_features: int, *, bias: bool, std: float) -> nn.Linear:
-    return init_linear_module(nn.Linear(in_features, out_features, bias=bias), std)
+def _make_linear(
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+) -> nn.Linear:
+    return nn.Linear(
+        in_features,
+        out_features,
+        bias=bias,
+        **factory_kwargs(device, dtype),
+    )
 
 
 def _append_to_cache(
@@ -79,32 +90,69 @@ def _append_to_cache(
     )
 
 
-class Gemma4DenseMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, init_std: float) -> None:
+class Gemma4DenseMLP(InitModule):
+    def __init__(
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            init_std: float,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.gate_proj = _make_linear(hidden_size, intermediate_size, bias=False, std=init_std)
-        self.up_proj = _make_linear(hidden_size, intermediate_size, bias=False, std=init_std)
-        self.down_proj = _make_linear(intermediate_size, hidden_size, bias=False, std=init_std)
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.gate_proj = _make_linear(hidden_size, intermediate_size, bias=False, **dd)
+        self.up_proj = _make_linear(hidden_size, intermediate_size, bias=False, **dd)
+        self.down_proj = _make_linear(intermediate_size, hidden_size, bias=False, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(gelu_tanh(self.gate_proj(x)) * self.up_proj(x))
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.up_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
 
-class Gemma4MoE(nn.Module):
-    def __init__(self, hidden_size: int, expert_dim: int, num_experts: int, top_k: int, init_std: float) -> None:
+
+class Gemma4MoE(InitModule):
+    def __init__(
+            self,
+            hidden_size: int,
+            expert_dim: int,
+            num_experts: int,
+            top_k: int,
+            init_std: float,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.expert_dim = expert_dim
         self.num_experts = num_experts
         self.top_k = top_k
-        self.router_norm = RMSNorm(hidden_size, with_scale=False)
-        self.router_scale = nn.Parameter(torch.ones(hidden_size))
-        self.per_expert_scale = nn.Parameter(torch.ones(num_experts))
-        self.router = _make_linear(hidden_size, num_experts, bias=False, std=init_std)
-        self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * expert_dim, hidden_size))
-        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, expert_dim))
-        nn.init.normal_(self.gate_up_proj, mean=0.0, std=init_std)
-        nn.init.normal_(self.down_proj, mean=0.0, std=init_std)
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.router_norm = RMSNorm(hidden_size, with_scale=False, **dd)
+        self.router_scale = nn.Parameter(torch.ones(hidden_size, **dd))
+        self.per_expert_scale = nn.Parameter(torch.ones(num_experts, **dd))
+        self.router = _make_linear(hidden_size, num_experts, bias=False, **dd)
+        self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * expert_dim, hidden_size, **dd))
+        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, expert_dim, **dd))
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.router.weight is not None:
+            nn.init.normal_(self.router.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.ones_(self.router_scale)
+        nn.init.ones_(self.per_expert_scale)
+        nn.init.normal_(self.gate_up_proj, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.down_proj, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         router_input = self.router_norm(x)
@@ -134,9 +182,19 @@ class Gemma4MoE(nn.Module):
         return output
 
 
-class Gemma4TextAttention(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int) -> None:
+class Gemma4TextAttention(InitModule):
+    def __init__(
+            self,
+            config: TextConfig,
+            layer_idx: int,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.attn_impl = config.attn_impl
@@ -160,18 +218,19 @@ class Gemma4TextAttention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == AttentionKind.SLIDING else None
         self.attn_logits_softcap = config.attn_logits_softcap
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        dd = factory_kwargs(device, dtype)
 
         self.q_proj = _make_linear(
             config.hidden_size,
             self.num_heads * self.key_dim,
             bias=False,
-            std=config.init_std,
+            **dd,
         )
         self.k_proj = _make_linear(
             config.hidden_size,
             self.num_kv_heads * self.key_dim,
             bias=False,
-            std=config.init_std,
+            **dd,
         )
         self.v_proj = None
         if not self.k_eq_v:
@@ -179,15 +238,33 @@ class Gemma4TextAttention(nn.Module):
                 config.hidden_size,
                 self.num_kv_heads * self.key_dim,
                 bias=False,
-                std=config.init_std,
+                **dd,
             )
-        self.o_proj = _make_linear(self.num_heads * self.key_dim, config.hidden_size, bias=False, std=config.init_std)
-        self.q_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale)
-        self.k_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale)
-        self.v_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=False)
+        self.o_proj = _make_linear(
+            self.num_heads * self.key_dim,
+            config.hidden_size,
+            bias=False,
+            **dd,
+        )
+        self.q_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale, **dd)
+        self.k_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=config.qk_norm_with_scale, **dd)
+        self.v_norm = RMSNorm(self.key_dim, eps=config.rms_norm_eps, with_scale=False, **dd)
 
         if self.attn_impl == "sdpa" and self.attn_logits_softcap is not None:
             raise ValueError("`attn_logits_softcap` is not supported with `attn_impl='sdpa'`.")
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.v_proj is not None:
+            nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.q_norm.weight is not None:
+            nn.init.ones_(self.q_norm.weight)
+        if self.k_norm.weight is not None:
+            nn.init.ones_(self.k_norm.weight)
+        if self.v_norm.weight is not None:
+            nn.init.ones_(self.v_norm.weight)
 
     def forward(
             self,
@@ -269,8 +346,16 @@ class Gemma4TextAttention(nn.Module):
         return self.o_proj(attn_output), layer_cache
 
 
-class Gemma4TextBlock(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int, ffn_hidden_size: int) -> None:
+class Gemma4TextBlock(InitModule):
+    def __init__(
+            self,
+            config: TextConfig,
+            layer_idx: int,
+            ffn_hidden_size: int,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -278,53 +363,68 @@ class Gemma4TextBlock(nn.Module):
         self.use_post_attn_norm = config.use_post_attn_norm
         self.use_post_ffn_norm = config.use_post_ffn_norm
         self.per_layer_input_dim = config.per_layer_input_dim
+        self.init_std = config.init_std
+        self.residual_init_std = resolve_residual_init_std(
+            config.init_std,
+            config.residual_init_std,
+            config.use_depth_scaled_residual_init,
+            config.num_layers,
+        )
 
-        self.attn = Gemma4TextAttention(config, layer_idx)
-        self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dd = factory_kwargs(device, dtype)
+        self.attn = Gemma4TextAttention(
+            config,
+            layer_idx,
+            residual_init_std=self.residual_init_std,
+            **dd,
+        )
+        self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
         self.post_attn_norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if config.use_post_attn_norm else None
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd) if config.use_post_attn_norm else None
         )
 
         if self.enable_moe:
-            self.pre_ffn2_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.mlp2 = Gemma4DenseMLP(config.hidden_size, ffn_hidden_size, config.init_std)
+            self.pre_ffn2_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+            self.mlp2 = Gemma4DenseMLP(config.hidden_size, ffn_hidden_size, config.init_std, self.residual_init_std, **dd)
             self.post_ffn2_norm = (
-                RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if config.use_post_ffn_norm else None
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd) if config.use_post_ffn_norm else None
             )
-            self.pre_ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.pre_ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
             self.moe = Gemma4MoE(
                 config.hidden_size,
                 config.expert_dim,
                 config.num_experts,
                 config.top_k_experts,
                 config.init_std,
+                self.residual_init_std,
+                **dd,
             )
             self.post_ffn1_norm = (
-                RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if config.use_post_ffn_norm else None
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd) if config.use_post_ffn_norm else None
             )
         else:
-            self.pre_ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.mlp = Gemma4DenseMLP(config.hidden_size, ffn_hidden_size, config.init_std)
+            self.pre_ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+            self.mlp = Gemma4DenseMLP(config.hidden_size, ffn_hidden_size, config.init_std, self.residual_init_std, **dd)
 
         self.post_ffn_norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if config.use_post_ffn_norm else None
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd) if config.use_post_ffn_norm else None
         )
-        self.layer_scalar = nn.Parameter(torch.ones(1))
+        self.layer_scalar = nn.Parameter(torch.ones(1, **dd))
 
         if self.per_layer_input_dim:
             self.per_layer_input_gate = _make_linear(
                 config.hidden_size,
                 config.per_layer_input_dim,
                 bias=False,
-                std=config.init_std,
+                **dd,
             )
             self.per_layer_projection = _make_linear(
                 config.per_layer_input_dim,
                 config.hidden_size,
                 bias=False,
-                std=config.init_std,
+                **dd,
             )
-            self.post_per_layer_input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_per_layer_input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
 
     def _forward_dense(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.pre_ffn_norm(hidden_states)
@@ -391,18 +491,61 @@ class Gemma4TextBlock(nn.Module):
         hidden_states = hidden_states * self.layer_scalar
         return hidden_states, kv_to_share
 
+    def _init_weights(self, ctx) -> None:
+        residual_std = self.init_std if self.residual_init_std is None else self.residual_init_std
+        if self.pre_attn_norm.weight is not None:
+            nn.init.ones_(self.pre_attn_norm.weight)
+        if self.post_attn_norm is not None and self.post_attn_norm.weight is not None:
+            nn.init.ones_(self.post_attn_norm.weight)
+        if self.pre_ffn_norm.weight is not None:
+            nn.init.ones_(self.pre_ffn_norm.weight)
+        if self.enable_moe:
+            if self.pre_ffn2_norm.weight is not None:
+                nn.init.ones_(self.pre_ffn2_norm.weight)
+            if self.post_ffn2_norm is not None and self.post_ffn2_norm.weight is not None:
+                nn.init.ones_(self.post_ffn2_norm.weight)
+            if self.post_ffn1_norm is not None and self.post_ffn1_norm.weight is not None:
+                nn.init.ones_(self.post_ffn1_norm.weight)
+        if self.post_ffn_norm is not None and self.post_ffn_norm.weight is not None:
+            nn.init.ones_(self.post_ffn_norm.weight)
+        if self.per_layer_input_dim:
+            nn.init.normal_(
+                self.per_layer_input_gate.weight,
+                mean=0.0,
+                std=self.init_std,
+                generator=ctx.generator,
+            )
+            nn.init.normal_(
+                self.per_layer_projection.weight,
+                mean=0.0,
+                std=residual_std,
+                generator=ctx.generator,
+            )
+            if self.post_per_layer_input_norm.weight is not None:
+                nn.init.ones_(self.post_per_layer_input_norm.weight)
+        nn.init.ones_(self.layer_scalar)
 
-class Gemma4TextTower(nn.Module):
-    def __init__(self, config: TextConfig) -> None:
+
+class Gemma4TextTower(InitModule):
+    def __init__(
+            self,
+            config: TextConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.config = config
-        self.token_embedding = ScaledEmbedding(
+        self.init_std = config.init_std
+        self.embed_scale = math.sqrt(config.hidden_size)
+        self.token_embedding = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
             padding_idx=config.pad_token_id,
-            init_std=config.init_std,
+            **dd,
         )
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
         self.kv_sharing_patterns = create_kv_sharing_patterns(
             config.kv_sharing,
             config.num_layers,
@@ -410,25 +553,47 @@ class Gemma4TextTower(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Gemma4TextBlock(config, idx, self._ffn_hidden_size(idx))
+                Gemma4TextBlock(config, idx, self._ffn_hidden_size(idx), **dd)
                 for idx in range(config.num_layers)
             ]
         )
 
         if config.per_layer_input_dim:
             self.per_layer_token_embedding = nn.Parameter(
-                torch.empty(config.vocab_size, config.num_layers, config.per_layer_input_dim)
+                torch.empty(config.vocab_size, config.num_layers, config.per_layer_input_dim, **dd)
             )
-            nn.init.normal_(self.per_layer_token_embedding, mean=0.0, std=config.init_std)
             self.per_layer_model_projection = _make_linear(
                 config.hidden_size,
                 config.num_layers * config.per_layer_input_dim,
                 bias=False,
-                std=config.init_std,
+                **dd,
+            )
+            self.per_layer_projection_norm = RMSNorm(config.per_layer_input_dim, eps=config.rms_norm_eps, **dd)
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.token_embedding.padding_idx is not None:
+            with torch.no_grad():
+                self.token_embedding.weight[self.token_embedding.padding_idx].zero_()
+        if self.final_norm.weight is not None:
+            nn.init.ones_(self.final_norm.weight)
+        if self.config.per_layer_input_dim:
+            nn.init.normal_(
+                self.per_layer_token_embedding,
+                mean=0.0,
+                std=self.init_std,
+                generator=ctx.generator,
+            )
+            nn.init.normal_(
+                self.per_layer_model_projection.weight,
+                mean=0.0,
+                std=self.init_std,
+                generator=ctx.generator,
             )
             with torch.no_grad():
-                self.per_layer_model_projection.weight.mul_(config.hidden_size**-0.5)
-            self.per_layer_projection_norm = RMSNorm(config.per_layer_input_dim, eps=config.rms_norm_eps)
+                self.per_layer_model_projection.weight.mul_(self.config.hidden_size**-0.5)
+            if self.per_layer_projection_norm.weight is not None:
+                nn.init.ones_(self.per_layer_projection_norm.weight)
 
     def _ffn_hidden_size(self, layer_idx: int) -> int:
         if self.config.enable_moe:
@@ -461,7 +626,7 @@ class Gemma4TextTower(nn.Module):
         return safe_token_ids(wrapped_ids, self.config.vocab_size)
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.token_embedding(self._embedding_token_ids(input_ids))
+        return self.token_embedding(self._embedding_token_ids(input_ids)) * self.embed_scale
 
     def project_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return F.linear(hidden_states, self.token_embedding.weight)

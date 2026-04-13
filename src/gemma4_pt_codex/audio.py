@@ -7,11 +7,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import AudioConfig
-from .layers import ClippedLinear, RMSNorm, gelu_tanh, init_linear_module
+from .layers import (
+    ClippedLinear,
+    RMSNorm,
+    gelu_tanh,
+)
+from .module_utils import InitModule, InitContext, factory_kwargs, resolve_residual_init_std
 
 
-def _make_linear(in_features: int, out_features: int, *, bias: bool = False, std: float = 1e-2) -> nn.Module:
-    return ClippedLinear(in_features, out_features, bias=bias, init_std=std)
+def _make_linear(
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = False,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+) -> nn.Module:
+    return ClippedLinear(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
 
 def _pad_time_dim(x: torch.Tensor, left: int, right: int, value: float = 0.0) -> torch.Tensor:
@@ -30,18 +42,24 @@ def _pad_time_dim(x: torch.Tensor, left: int, right: int, value: float = 0.0) ->
     return torch.cat(parts, dim=1)
 
 
-class Gemma4AudioSubsampler(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+class Gemma4AudioSubsampler(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        self.init_std = config.init_std
         c0, c1 = config.subsampling_channels
         subsampled_bins = ((config.num_mel_bins + 1) // 2 + 1) // 2
-        self.conv0 = nn.Conv2d(1, c0, kernel_size=3, stride=2, padding=1, bias=False)
-        self.conv1 = nn.Conv2d(c0, c1, kernel_size=3, stride=2, padding=1, bias=False)
-        init_linear_module(self.conv0, config.init_std)
-        init_linear_module(self.conv1, config.init_std)
-        self.norm0 = nn.LayerNorm(c0)
-        self.norm1 = nn.LayerNorm(c1)
-        self.output_proj = _make_linear(c1 * subsampled_bins, config.hidden_size, bias=False, std=config.init_std)
+        dd = factory_kwargs(device, dtype)
+        self.conv0 = nn.Conv2d(1, c0, kernel_size=3, stride=2, padding=1, bias=False, **dd)
+        self.conv1 = nn.Conv2d(c0, c1, kernel_size=3, stride=2, padding=1, bias=False, **dd)
+        self.norm0 = nn.LayerNorm(c0, **dd)
+        self.norm1 = nn.LayerNorm(c1, **dd)
+        self.output_proj = nn.Linear(c1 * subsampled_bins, config.hidden_size, bias=False, **dd)
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = features.unsqueeze(1)
@@ -58,16 +76,42 @@ class Gemma4AudioSubsampler(nn.Module):
         hidden = self.output_proj(hidden)
         return hidden, mask
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.conv0.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.conv1.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.norm0.weight is not None:
+            nn.init.ones_(self.norm0.weight)
+        if self.norm0.bias is not None:
+            nn.init.zeros_(self.norm0.bias)
+        if self.norm1.weight is not None:
+            nn.init.ones_(self.norm1.weight)
+        if self.norm1.bias is not None:
+            nn.init.zeros_(self.norm1.bias)
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
 
-class Gemma4AudioFeedForward(nn.Module):
-    def __init__(self, config: AudioConfig, residual_weight: float = 0.5) -> None:
+
+class Gemma4AudioFeedForward(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            residual_weight: float = 0.5,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
         self.residual_weight = residual_weight
         self.gradient_clipping = config.gradient_clipping
-        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn1 = _make_linear(config.hidden_size, config.hidden_size * 4, bias=False, std=config.init_std)
-        self.ffn2 = _make_linear(config.hidden_size * 4, config.hidden_size, bias=False, std=config.init_std)
-        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.ffn1 = _make_linear(config.hidden_size, config.hidden_size * 4, bias=False, **dd)
+        self.ffn2 = _make_linear(config.hidden_size * 4, config.hidden_size, bias=False, **dd)
+        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -79,22 +123,44 @@ class Gemma4AudioFeedForward(nn.Module):
         x = self.post_norm(x)
         return residual + x * self.residual_weight
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        nn.init.normal_(self.ffn1.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.ffn1.bias is not None:
+            nn.init.zeros_(self.ffn1.bias)
+        nn.init.normal_(self.ffn2.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.ffn2.bias is not None:
+            nn.init.zeros_(self.ffn2.bias)
+        if self.post_norm.weight is not None:
+            nn.init.ones_(self.post_norm.weight)
 
-class Gemma4AudioLightConv(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+
+class Gemma4AudioLightConv(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.linear_start = _make_linear(config.hidden_size, 2 * config.hidden_size, bias=False, std=config.init_std)
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.linear_start = _make_linear(config.hidden_size, 2 * config.hidden_size, bias=False, **dd)
         self.depthwise = nn.Conv1d(
             config.hidden_size,
             config.hidden_size,
             kernel_size=config.conv_kernel_size,
             groups=config.hidden_size,
             bias=False,
+            **dd,
         )
-        init_linear_module(self.depthwise, config.init_std)
-        self.conv_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.linear_end = _make_linear(config.hidden_size, config.hidden_size, bias=False, std=config.init_std)
+        self.conv_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.linear_end = _make_linear(config.hidden_size, config.hidden_size, bias=False, **dd)
         self.gradient_clipping = config.gradient_clipping
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -108,6 +174,21 @@ class Gemma4AudioLightConv(nn.Module):
         x = F.silu(self.conv_norm(x))
         x = self.linear_end(x)
         return residual + x
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        nn.init.normal_(self.linear_start.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.linear_start.bias is not None:
+            nn.init.zeros_(self.linear_start.bias)
+        nn.init.normal_(self.depthwise.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.depthwise.bias is not None:
+            nn.init.zeros_(self.depthwise.bias)
+        if self.conv_norm.weight is not None:
+            nn.init.ones_(self.conv_norm.weight)
+        nn.init.normal_(self.linear_end.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.linear_end.bias is not None:
+            nn.init.zeros_(self.linear_end.bias)
 
 
 def _extract_block_context(
@@ -148,18 +229,28 @@ def _causal_valid_mask(config: AudioConfig, device: torch.device) -> torch.Tenso
     return lower & upper
 
 
-class Gemma4AudioRelativePosition(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+class Gemma4AudioRelativePosition(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.num_heads = config.num_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_heads
         self.left_context = config.left_context
         self.right_context = config.right_context
-        self.pos_proj = init_linear_module(
-            nn.Linear(config.hidden_size, config.num_heads * self.head_dim, bias=False),
-            config.init_std,
+        self.pos_proj = nn.Linear(
+            config.hidden_size,
+            config.num_heads * self.head_dim,
+            bias=False,
+            **factory_kwargs(device, dtype),
         )
+
+    def _init_weights(self, ctx: InitContext) -> None:
         nn.init.xavier_uniform_(self.pos_proj.weight)
 
     def forward(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
@@ -197,31 +288,59 @@ class Gemma4AudioRelativePosition(nn.Module):
         return term_ac + term_bd
 
 
-class Gemma4AudioLocalAttention(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+class Gemma4AudioLocalAttention(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.init_std = config.init_std
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
-        self.q_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, std=config.init_std)
-        self.k_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, std=config.init_std)
-        self.v_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, std=config.init_std)
-        self.relative_position = Gemma4AudioRelativePosition(config)
-        self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim))
+        dd = factory_kwargs(device, dtype)
+        self.q_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, **dd)
+        self.k_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, **dd)
+        self.v_proj = _make_linear(config.hidden_size, config.hidden_size, bias=False, **dd)
+        self.relative_position = Gemma4AudioRelativePosition(config, **dd)
+        self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim, **dd))
         self.softcap = 50.0
         self.query_scale = (self.head_dim**-0.5) / math.log(2.0)
         self.key_scale = math.log1p(math.e) / math.log(2.0)
+        context = config.chunk_size + max(0, config.left_context - 1) + config.right_context
         self.register_buffer(
             "causal_valid_mask",
-            self._build_causal_valid_mask(),
+            torch.empty(config.chunk_size, context, dtype=torch.bool, device=device),
             persistent=False,
         )
+        self._init_non_persistent_buffers()
 
     def _build_causal_valid_mask(self) -> torch.Tensor:
         return _causal_valid_mask(self.config, device=self.per_dim_scale.device)
 
-    def init_non_persistent_buffers(self) -> None:
-        self.causal_valid_mask = self._build_causal_valid_mask()
+    def _init_non_persistent_buffers(self) -> None:
+        mask = self._build_causal_valid_mask()
+        if self.causal_valid_mask.is_meta or mask.is_meta:
+            self.causal_valid_mask = mask
+        else:
+            with torch.no_grad():
+                self.causal_valid_mask.copy_(mask)
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        self._init_non_persistent_buffers()
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        nn.init.ones_(self.per_dim_scale)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
@@ -267,14 +386,24 @@ class Gemma4AudioLocalAttention(nn.Module):
         return context[:, :seq_len]
 
 
-class Gemma4AudioAttentionBlock(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+class Gemma4AudioAttentionBlock(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
         self.gradient_clipping = config.gradient_clipping
-        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = Gemma4AudioLocalAttention(config)
-        self.post = _make_linear(config.hidden_size, config.hidden_size, bias=False, std=config.init_std)
-        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.attn = Gemma4AudioLocalAttention(config, **dd)
+        self.post = _make_linear(config.hidden_size, config.hidden_size, bias=False, **dd)
+        self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -287,15 +416,55 @@ class Gemma4AudioAttentionBlock(nn.Module):
         x = self.post_norm(x)
         return residual + x
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        nn.init.normal_(self.post.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.post.bias is not None:
+            nn.init.zeros_(self.post.bias)
+        if self.post_norm.weight is not None:
+            nn.init.ones_(self.post_norm.weight)
 
-class Gemma4AudioConformerLayer(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+
+class Gemma4AudioConformerLayer(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.ffn_start = Gemma4AudioFeedForward(config, residual_weight=0.5)
-        self.attn = Gemma4AudioAttentionBlock(config)
-        self.lightconv = Gemma4AudioLightConv(config)
-        self.ffn_end = Gemma4AudioFeedForward(config, residual_weight=0.5)
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dd = factory_kwargs(device, dtype)
+        residual_init_std = resolve_residual_init_std(
+            config.init_std,
+            config.residual_init_std,
+            config.use_depth_scaled_residual_init,
+            config.num_layers,
+        )
+        self.ffn_start = Gemma4AudioFeedForward(
+            config,
+            residual_weight=0.5,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.attn = Gemma4AudioAttentionBlock(
+            config,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.lightconv = Gemma4AudioLightConv(
+            config,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.ffn_end = Gemma4AudioFeedForward(
+            config,
+            residual_weight=0.5,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
         self.gradient_clipping = config.gradient_clipping
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -307,16 +476,32 @@ class Gemma4AudioConformerLayer(nn.Module):
         x = x.clamp(-self.gradient_clipping, self.gradient_clipping)
         return self.final_norm(x)
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.final_norm.weight is not None:
+            nn.init.ones_(self.final_norm.weight)
 
-class Gemma4AudioEncoder(nn.Module):
-    def __init__(self, config: AudioConfig) -> None:
+
+class Gemma4AudioEncoder(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.subsampler = Gemma4AudioSubsampler(config)
-        self.layers = nn.ModuleList([Gemma4AudioConformerLayer(config) for _ in range(config.num_layers)])
-        self.output_proj = init_linear_module(
-            nn.Linear(config.hidden_size, config.output_size, bias=True),
-            config.init_std,
+        self.init_std = config.init_std
+        dd = factory_kwargs(device, dtype)
+        self.subsampler = Gemma4AudioSubsampler(config, **dd)
+        self.layers = nn.ModuleList([
+            Gemma4AudioConformerLayer(config, **dd) for _ in range(config.num_layers)
+        ])
+        self.output_proj = nn.Linear(
+            config.hidden_size,
+            config.output_size,
+            bias=True,
+            **dd,
         )
 
     def forward(self, features: torch.Tensor, feature_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -333,21 +518,37 @@ class Gemma4AudioEncoder(nn.Module):
         hidden = hidden.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         return hidden, pad_mask
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
 
-class Gemma4AudioTower(nn.Module):
-    def __init__(self, config: AudioConfig, text_hidden_size: int | None = None) -> None:
+
+class Gemma4AudioTower(InitModule):
+    def __init__(
+            self,
+            config: AudioConfig,
+            text_hidden_size: int | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.config = config
-        self.encoder = Gemma4AudioEncoder(config)
+        self.init_std = config.init_std
+        self.encoder = Gemma4AudioEncoder(config, **dd)
         self.to_text = None
         self.to_text_norm = None
         if text_hidden_size is not None:
-            self.to_text = init_linear_module(
-                nn.Linear(config.output_size, text_hidden_size, bias=False),
-                config.init_std,
+            self.to_text = nn.Linear(
+                config.output_size,
+                text_hidden_size,
+                bias=False,
+                **dd,
             )
             norm_dim = config.output_size if config.projection_norm_before_text else text_hidden_size
-            self.to_text_norm = RMSNorm(norm_dim, eps=config.rms_norm_eps, with_scale=False)
+            self.to_text_norm = RMSNorm(norm_dim, eps=config.rms_norm_eps, with_scale=False, **dd)
 
     def forward(self, features: torch.Tensor, feature_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder(features, feature_mask)
@@ -377,3 +578,11 @@ class Gemma4AudioTower(nn.Module):
             tokens = tokens.view(batch, num_clips, tokens.shape[1], tokens.shape[2]).flatten(1, 2)
             valid_mask = valid_mask.view(batch, num_clips, valid_mask.shape[1]).flatten(1, 2)
         return tokens, valid_mask
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.to_text is not None:
+            nn.init.normal_(self.to_text.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.to_text.bias is not None:
+                nn.init.zeros_(self.to_text.bias)
+        if self.to_text_norm is not None and self.to_text_norm.weight is not None:
+            nn.init.ones_(self.to_text_norm.weight)

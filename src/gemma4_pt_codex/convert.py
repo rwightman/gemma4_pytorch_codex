@@ -763,10 +763,6 @@ def _convert_hf_audio_entry(
             "subsample_conv_projection.layer0.norm.weight": "audio.encoder.subsampler.norm0.weight",
             "subsample_conv_projection.layer1.norm.weight": "audio.encoder.subsampler.norm1.weight",
             "subsample_conv_projection.input_proj_linear.weight": "audio.encoder.subsampler.output_proj.weight",
-            "subsample_conv_projection.input_proj_linear.input_min": "audio.encoder.subsampler.output_proj.input_min",
-            "subsample_conv_projection.input_proj_linear.input_max": "audio.encoder.subsampler.output_proj.input_max",
-            "subsample_conv_projection.input_proj_linear.output_min": "audio.encoder.subsampler.output_proj.output_min",
-            "subsample_conv_projection.input_proj_linear.output_max": "audio.encoder.subsampler.output_proj.output_max",
             "output_proj.weight": "audio.encoder.output_proj.weight",
             "output_proj.bias": "audio.encoder.output_proj.bias",
         }

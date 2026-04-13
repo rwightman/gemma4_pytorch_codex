@@ -317,18 +317,6 @@ def native_to_hf_dense_state_dict(model: Gemma4Model) -> dict[str, torch.Tensor]
     hf_state["model.audio_tower.subsample_conv_projection.input_proj_linear.weight"] = state[
         "audio.encoder.subsampler.output_proj.weight"
     ].clone()
-    hf_state["model.audio_tower.subsample_conv_projection.input_proj_linear.input_min"] = state[
-        "audio.encoder.subsampler.output_proj.input_min"
-    ].clone()
-    hf_state["model.audio_tower.subsample_conv_projection.input_proj_linear.input_max"] = state[
-        "audio.encoder.subsampler.output_proj.input_max"
-    ].clone()
-    hf_state["model.audio_tower.subsample_conv_projection.input_proj_linear.output_min"] = state[
-        "audio.encoder.subsampler.output_proj.output_min"
-    ].clone()
-    hf_state["model.audio_tower.subsample_conv_projection.input_proj_linear.output_max"] = state[
-        "audio.encoder.subsampler.output_proj.output_max"
-    ].clone()
     hf_state["model.audio_tower.output_proj.weight"] = state["audio.encoder.output_proj.weight"].clone()
     hf_state["model.audio_tower.output_proj.bias"] = state["audio.encoder.output_proj.bias"].clone()
     hf_state["model.embed_audio.embedding_projection.weight"] = state["audio.to_text.weight"].clone()

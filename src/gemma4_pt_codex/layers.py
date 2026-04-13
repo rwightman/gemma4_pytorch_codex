@@ -6,27 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .module_utils import factory_kwargs
+
 
 K_MASK = -2.3819763e38
 
 
 def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
-
-
-def init_linear_weight(weight: torch.Tensor, std: float = 1e-2) -> None:
-    nn.init.normal_(weight, mean=0.0, std=std)
-
-
-def init_embedding_weight(weight: torch.Tensor, std: float = 1e-2) -> None:
-    nn.init.normal_(weight, mean=0.0, std=std)
-
-
-def init_linear_module(module: nn.Linear, std: float = 1e-2) -> nn.Linear:
-    init_linear_weight(module.weight, std)
-    if module.bias is not None:
-        nn.init.zeros_(module.bias)
-    return module
 
 
 def safe_token_ids(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -124,29 +111,38 @@ def merge_flat_embeddings(
     return merged
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True) -> None:
-        super().__init__()
-        self.eps = eps
-        self.with_scale = with_scale
-        if with_scale:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter("weight", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean_square = x.float().pow(2).mean(dim=-1, keepdim=True)
-        out = x.float() * torch.rsqrt(mean_square + self.eps)
-        if self.weight is not None:
-            out = out * self.weight.float()
-        return out.to(dtype=x.dtype)
+class RMSNorm(nn.RMSNorm):
+    def __init__(
+            self,
+            dim: int,
+            eps: float = 1e-6,
+            with_scale: bool = True,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(
+            dim,
+            eps=eps,
+            elementwise_affine=with_scale,
+            **factory_kwargs(device, dtype),
+        )
 
 
 class VisionRMSNorm(RMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__(dim, eps=eps, with_scale=True)
-        nn.init.zeros_(self.weight)
+    def __init__(
+            self,
+            dim: int,
+            eps: float = 1e-6,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(dim, eps=eps, with_scale=True, device=device, dtype=dtype)
 
+    def reset_parameters(self) -> None:
+        if self.weight is not None:
+            nn.init.zeros_(self.weight)
 
 class ClippedLinear(nn.Linear):
     def __init__(
@@ -154,48 +150,26 @@ class ClippedLinear(nn.Linear):
             in_features: int,
             out_features: int,
             bias: bool = False,
-            init_std: float = 1e-2,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
     ) -> None:
-        self.init_std = init_std
-        super().__init__(in_features, out_features, bias=bias)
-        self.register_buffer("input_min", torch.tensor(float("-inf")))
-        self.register_buffer("input_max", torch.tensor(float("inf")))
-        self.register_buffer("output_min", torch.tensor(float("-inf")))
-        self.register_buffer("output_max", torch.tensor(float("inf")))
-
-    def reset_parameters(self) -> None:
-        init_linear_weight(self.weight, self.init_std)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            **factory_kwargs(device, dtype),
+        )
+        scalar_dd = factory_kwargs(device, dtype)
+        self.register_buffer("input_min", torch.tensor(float("-inf"), **scalar_dd))
+        self.register_buffer("input_max", torch.tensor(float("inf"), **scalar_dd))
+        self.register_buffer("output_min", torch.tensor(float("-inf"), **scalar_dd))
+        self.register_buffer("output_max", torch.tensor(float("inf"), **scalar_dd))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.clamp(self.input_min.item(), self.input_max.item())
         x = F.linear(x, self.weight, self.bias)
         return x.clamp(self.output_min.item(), self.output_max.item())
-
-
-class ScaledEmbedding(nn.Embedding):
-    def __init__(
-            self,
-            num_embeddings: int,
-            embedding_dim: int,
-            padding_idx: int | None = None,
-            *,
-            init_std: float = 1e-2,
-            scale: float | None = None,
-    ) -> None:
-        self.init_std = init_std
-        self.embed_scale = math.sqrt(embedding_dim) if scale is None else scale
-        super().__init__(num_embeddings, embedding_dim, padding_idx=padding_idx)
-
-    def reset_parameters(self) -> None:
-        init_embedding_weight(self.weight, self.init_std)
-        if self.padding_idx is not None:
-            with torch.no_grad():
-                self.weight[self.padding_idx].zero_()
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().forward(input_ids) * self.embed_scale
 
 
 def _rope_half_rotation(

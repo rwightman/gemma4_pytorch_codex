@@ -20,8 +20,8 @@ from .layers import (
     VisionRMSNorm,
     apply_multidim_rope,
     gelu_tanh,
-    init_linear_module,
 )
+from .module_utils import InitContext, InitModule, factory_kwargs, resolve_residual_init_std
 
 
 POSITIONS_PAD_VALUE = -1
@@ -91,19 +91,46 @@ def avg_pool_by_positions(
     return output, mask
 
 
-def _make_linear(config: VisionConfig, in_features: int, out_features: int, *, bias: bool = False) -> nn.Module:
+def _make_linear(
+        config: VisionConfig,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = False,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+) -> nn.Module:
     if config.use_clipped_linears:
-        return ClippedLinear(in_features, out_features, bias=bias, init_std=config.init_std)
-    return init_linear_module(nn.Linear(in_features, out_features, bias=bias), config.init_std)
+        return ClippedLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+    return nn.Linear(in_features, out_features, bias=bias, **factory_kwargs(device, dtype))
 
 
-class Gemma4VisionPatchEmbed(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+class Gemma4VisionPatchEmbed(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.config = config
-        self.input_proj = _make_linear(config, config.patch_dim, config.hidden_size, bias=False)
-        self.position_table = nn.Parameter(torch.empty(config.position_embedding_size, 2, config.hidden_size))
-        nn.init.normal_(self.position_table, mean=0.0, std=config.position_init_std)
+        self.init_std = config.init_std
+        self.position_init_std = config.position_init_std
+        dd = factory_kwargs(device, dtype)
+        self.input_proj = nn.Linear(config.patch_dim, config.hidden_size, bias=False, **dd)
+        self.position_table = nn.Parameter(torch.empty(config.position_embedding_size, 2, config.hidden_size, **dd))
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.input_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+        nn.init.normal_(self.position_table, mean=0.0, std=self.position_init_std, generator=ctx.generator)
 
     def forward(self, patches: torch.Tensor, positions_xy: torch.Tensor) -> torch.Tensor:
         hidden_states = self.input_proj(patches.to(dtype=self.input_proj.weight.dtype))
@@ -113,35 +140,66 @@ class Gemma4VisionPatchEmbed(nn.Module):
         ).to(hidden_states.dtype)
 
 
-class Gemma4VisionMLP(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+class Gemma4VisionMLP(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.gate_proj = _make_linear(config, config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = _make_linear(config, config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = _make_linear(config, config.intermediate_size, config.hidden_size, bias=False)
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.gate_proj = _make_linear(config, config.hidden_size, config.intermediate_size, bias=False, **dd)
+        self.up_proj = _make_linear(config, config.hidden_size, config.intermediate_size, bias=False, **dd)
+        self.down_proj = _make_linear(config, config.intermediate_size, config.hidden_size, bias=False, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(gelu_tanh(self.gate_proj(x)) * self.up_proj(x))
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.gate_proj.bias is not None:
+            nn.init.zeros_(self.gate_proj.bias)
+        nn.init.normal_(self.up_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.up_proj.bias is not None:
+            nn.init.zeros_(self.up_proj.bias)
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
 
-class Gemma4VisionAttention(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+
+class Gemma4VisionAttention(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.init_std = config.init_std
+        self.residual_init_std = config.init_std if residual_init_std is None else residual_init_std
         self.attn_impl = config.attn_impl
         self.num_heads = config.num_heads
         self.num_kv_heads = config.num_kv_heads
         self.head_dim = config.head_dim
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        dd = factory_kwargs(device, dtype)
 
-        self.q_proj = _make_linear(config, config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = _make_linear(config, config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = _make_linear(config, config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = _make_linear(config, self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        self.q_proj = _make_linear(config, config.hidden_size, self.num_heads * self.head_dim, bias=False, **dd)
+        self.k_proj = _make_linear(config, config.hidden_size, self.num_kv_heads * self.head_dim, bias=False, **dd)
+        self.v_proj = _make_linear(config, config.hidden_size, self.num_kv_heads * self.head_dim, bias=False, **dd)
+        self.o_proj = _make_linear(config, self.num_heads * self.head_dim, config.hidden_size, bias=False, **dd)
 
-        self.q_norm = VisionRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = VisionRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+        self.q_norm = VisionRMSNorm(self.head_dim, eps=config.rms_norm_eps, **dd)
+        self.k_norm = VisionRMSNorm(self.head_dim, eps=config.rms_norm_eps, **dd)
+        self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False, **dd)
 
     def forward(
             self,
@@ -210,16 +268,49 @@ class Gemma4VisionAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.o_proj.bias is not None:
+            nn.init.zeros_(self.o_proj.bias)
+        if self.q_norm.weight is not None:
+            nn.init.zeros_(self.q_norm.weight)
+        if self.k_norm.weight is not None:
+            nn.init.zeros_(self.k_norm.weight)
+        if self.v_norm.weight is not None:
+            nn.init.ones_(self.v_norm.weight)
 
-class Gemma4VisionBlock(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+
+class Gemma4VisionBlock(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.input_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ffn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_ffn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = Gemma4VisionAttention(config)
-        self.mlp = Gemma4VisionMLP(config)
+        dd = factory_kwargs(device, dtype)
+        residual_init_std = resolve_residual_init_std(
+            config.init_std,
+            config.residual_init_std,
+            config.use_depth_scaled_residual_init,
+            config.num_layers,
+        )
+        self.input_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.post_attn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.pre_ffn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.post_ffn_norm = VisionRMSNorm(config.hidden_size, eps=config.rms_norm_eps, **dd)
+        self.attn = Gemma4VisionAttention(config, residual_init_std=residual_init_std, **dd)
+        self.mlp = Gemma4VisionMLP(config, residual_init_std=residual_init_std, **dd)
 
     def forward(
             self,
@@ -239,10 +330,27 @@ class Gemma4VisionBlock(nn.Module):
         hidden_states = self.post_ffn_norm(hidden_states)
         return residual + hidden_states
 
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.input_norm.weight is not None:
+            nn.init.zeros_(self.input_norm.weight)
+        if self.post_attn_norm.weight is not None:
+            nn.init.zeros_(self.post_attn_norm.weight)
+        if self.pre_ffn_norm.weight is not None:
+            nn.init.zeros_(self.pre_ffn_norm.weight)
+        if self.post_ffn_norm.weight is not None:
+            nn.init.zeros_(self.post_ffn_norm.weight)
 
-class Gemma4VisionPooler(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+
+class Gemma4VisionPooler(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        _ = device, dtype
         self.config = config
         self.root_hidden_size = math.sqrt(config.hidden_size)
 
@@ -278,25 +386,43 @@ class Gemma4VisionPooler(nn.Module):
         )
 
 
-class Gemma4VisionStandardize(nn.Module):
-    def __init__(self, hidden_size: int) -> None:
+class Gemma4VisionStandardize(InitModule):
+    def __init__(
+            self,
+            hidden_size: int,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.scale = nn.Parameter(torch.ones(hidden_size))
-        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        dd = factory_kwargs(device, dtype)
+        self.scale = nn.Parameter(torch.ones(hidden_size, **dd))
+        self.bias = nn.Parameter(torch.zeros(hidden_size, **dd))
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        nn.init.ones_(self.scale)
+        nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.bias) * self.scale
 
 
-class Gemma4VisionEncoder(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+class Gemma4VisionEncoder(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.config = config
         self.image_processor = Gemma4ImageProcessor.from_config(config)
-        self.patch_embed = Gemma4VisionPatchEmbed(config)
-        self.layers = nn.ModuleList([Gemma4VisionBlock(config) for _ in range(config.num_layers)])
-        self.pooler = Gemma4VisionPooler(config)
-        self.standardize = Gemma4VisionStandardize(config.hidden_size) if config.standardize_embeddings else None
+        self.patch_embed = Gemma4VisionPatchEmbed(config, **dd)
+        self.layers = nn.ModuleList([Gemma4VisionBlock(config, **dd) for _ in range(config.num_layers)])
+        self.pooler = Gemma4VisionPooler(config, **dd)
+        self.standardize = Gemma4VisionStandardize(config.hidden_size, **dd) if config.standardize_embeddings else None
 
     def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
         """Convert raw images into padded patch tensors for the vision stack."""
@@ -343,16 +469,25 @@ class Gemma4VisionEncoder(nn.Module):
         return tuple(standardized)
 
 
-class Gemma4VisionTower(nn.Module):
-    def __init__(self, config: VisionConfig, text_hidden_size: int | None = None) -> None:
+class Gemma4VisionTower(InitModule):
+    def __init__(
+            self,
+            config: VisionConfig,
+            text_hidden_size: int | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.config = config
-        self.encoder = Gemma4VisionEncoder(config)
+        self.init_std = config.init_std
+        self.encoder = Gemma4VisionEncoder(config, **dd)
         self.to_text_norm = None
         self.to_text = None
         if text_hidden_size is not None:
-            self.to_text_norm = RMSNorm(config.hidden_size, eps=config.projection_norm_eps, with_scale=False)
-            self.to_text = init_linear_module(nn.Linear(config.hidden_size, text_hidden_size, bias=False), 1e-2)
+            self.to_text_norm = RMSNorm(config.hidden_size, eps=config.projection_norm_eps, with_scale=False, **dd)
+            self.to_text = nn.Linear(config.hidden_size, text_hidden_size, bias=False, **dd)
 
     def forward(
             self,
@@ -400,3 +535,11 @@ class Gemma4VisionTower(nn.Module):
             tokens = tokens.flatten(1, 2)
             mask = mask.flatten(1, 2)
         return tokens, mask
+
+    def _init_weights(self, ctx: InitContext) -> None:
+        if self.to_text_norm is not None and self.to_text_norm.weight is not None:
+            nn.init.ones_(self.to_text_norm.weight)
+        if self.to_text is not None:
+            nn.init.normal_(self.to_text.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.to_text.bias is not None:
+                nn.init.zeros_(self.to_text.bias)

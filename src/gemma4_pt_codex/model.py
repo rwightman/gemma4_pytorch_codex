@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
@@ -19,6 +18,7 @@ from .layers import (
     make_causal_bidirectional_mask,
     merge_flat_embeddings,
 )
+from .module_utils import InitContext, InitModule
 from .processing import Gemma4Processor, PromptAudioInput, PromptImageInput
 from .text import Gemma4TextTower, TextKVCache
 from .tokenizer import Gemma4Tokenizer
@@ -29,16 +29,21 @@ CONFIG_NAME = "config.json"
 SAFE_WEIGHTS_NAME = "model.safetensors"
 TORCH_WEIGHTS_NAME = "pytorch_model.bin"
 
+_LEGACY_UNCLIPPED_LINEAR_BOUND_KEYS = (
+    "vision.encoder.patch_embed.input_proj.input_min",
+    "vision.encoder.patch_embed.input_proj.input_max",
+    "vision.encoder.patch_embed.input_proj.output_min",
+    "vision.encoder.patch_embed.input_proj.output_max",
+    "audio.encoder.subsampler.output_proj.input_min",
+    "audio.encoder.subsampler.output_proj.input_max",
+    "audio.encoder.subsampler.output_proj.output_min",
+    "audio.encoder.subsampler.output_proj.output_max",
+)
 
-def _run_non_persistent_buffer_init(module: nn.Module) -> None:
-    """Rebuild runtime-only buffers on child modules that opt into it."""
-    for submodule in module.modules():
-        if submodule is module:
-            continue
-        init_method = type(submodule).__dict__.get("init_non_persistent_buffers")
-        if init_method is None:
-            continue
-        init_method(submodule)
+
+def _drop_legacy_unclipped_linear_bounds(state_dict: dict[str, torch.Tensor]) -> None:
+    for key in _LEGACY_UNCLIPPED_LINEAR_BOUND_KEYS:
+        state_dict.pop(key, None)
 
 
 @dataclass
@@ -135,27 +140,66 @@ def _build_audio_token_mask(
     return mask
 
 
-class Gemma4Model(nn.Module):
+class Gemma4Model(InitModule):
     """Top-level Gemma 4 multimodal model."""
 
-    def __init__(self, config: Gemma4Config) -> None:
+    def __init__(
+            self,
+            config: Gemma4Config,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.text = Gemma4TextTower(config.text)
+        self.text = Gemma4TextTower(config.text, device=device, dtype=dtype)
         self.vision = (
-            Gemma4VisionTower(config.vision, text_hidden_size=config.text.hidden_size)
+            Gemma4VisionTower(
+                config.vision,
+                text_hidden_size=config.text.hidden_size,
+                device=device,
+                dtype=dtype,
+            )
             if config.vision is not None
             else None
         )
         self.audio = (
-            Gemma4AudioTower(config.audio, text_hidden_size=config.text.hidden_size)
+            Gemma4AudioTower(
+                config.audio,
+                text_hidden_size=config.text.hidden_size,
+                device=device,
+                dtype=dtype,
+            )
             if config.audio is not None
             else None
         )
+        if not any(param.is_meta for param in self.parameters()):
+            self.init_weights()
 
-    def init_non_persistent_buffers(self) -> None:
+    def _init_non_persistent_buffers(self) -> None:
         """Rebuild runtime-only buffers after meta-init or state-dict assignment."""
-        _run_non_persistent_buffer_init(self)
+        return
+
+    def materialize(
+            self,
+            *,
+            device: torch.device | str,
+            dtype: torch.dtype | None = None,
+            init_weights: bool = True,
+            ctx: InitContext | None = None,
+    ) -> "Gemma4Model":
+        target_device = torch.device(device)
+        if any(param.device.type == "meta" for param in self.parameters()):
+            if dtype is not None:
+                self.to(dtype=dtype)
+            self.to_empty(device=target_device)
+        else:
+            self.to(device=target_device, dtype=dtype)
+        if init_weights:
+            self.init_weights(ctx)
+        else:
+            self.init_non_persistent_buffers()
+        return self
 
     def preprocess_images(self, images: ImageBatchInput) -> Gemma4ImageBatch:
         """Convert raw images into padded patch tensors for the vision tower."""
@@ -663,6 +707,8 @@ class Gemma4Model(nn.Module):
             raise FileNotFoundError(
                 f"Could not find {SAFE_WEIGHTS_NAME} or {TORCH_WEIGHTS_NAME} in {load_directory}."
             )
+
+        _drop_legacy_unclipped_linear_bounds(state_dict)
 
         target_device = torch.device(device)
         with torch.device("meta"):

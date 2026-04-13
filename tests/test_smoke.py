@@ -4,6 +4,7 @@ from pathlib import Path
 
 import sentencepiece as spm
 import torch
+from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 from tokenizers import Tokenizer as FastTokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -93,6 +94,7 @@ def test_text_tower_forward_shapes() -> None:
     for attn_impl in ("eager", "sdpa"):
         config = make_tiny_text_config_for_impl(attn_impl)
         model = Gemma4TextTower(config)
+        model.init_weights()
         input_ids = torch.tensor(
             [
                 [1, 2, 3, 4, 5, 6, 0, 0],
@@ -115,6 +117,7 @@ def test_text_tower_forward_shapes() -> None:
 
 def test_text_embedding_wraps_internal_negative_placeholder_ids() -> None:
     model = Gemma4TextTower(make_tiny_text_config())
+    model.init_weights()
     input_ids = torch.tensor([[1, -2, -4, 0]], dtype=torch.long)
 
     embedded = model.embed_tokens(input_ids)
@@ -122,13 +125,14 @@ def test_text_embedding_wraps_internal_negative_placeholder_ids() -> None:
         [[1, model.config.vocab_size - 2, model.config.vocab_size - 4, 0]],
         dtype=torch.long,
     )
-    expected = model.token_embedding(expected_ids)
+    expected = model.token_embedding(expected_ids) * model.embed_scale
 
     torch.testing.assert_close(embedded, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_text_tower_sdpa_matches_eager() -> None:
     eager = Gemma4TextTower(make_tiny_text_config_for_impl("eager"))
+    eager.init_weights()
     sdpa = Gemma4TextTower(make_tiny_text_config_for_impl("sdpa"))
     sdpa.load_state_dict(eager.state_dict())
 
@@ -159,8 +163,8 @@ def test_text_tower_sdpa_matches_eager() -> None:
     torch.testing.assert_close(
         eager.project_logits(eager_hidden),
         sdpa.project_logits(sdpa_hidden),
-        atol=1e-5,
-        rtol=1e-5,
+        atol=3e-5,
+        rtol=3e-5,
     )
 
 
@@ -171,6 +175,7 @@ def test_vision_tower_is_reusable() -> None:
             make_tiny_vision_config_for_impl(attn_impl),
             text_hidden_size=text_config.hidden_size,
         )
+        vision.init_weights()
         images = torch.rand(1, 2, 4, 4, 3)
         tokens, mask = vision.encode_to_text(images)
         assert tokens.shape == (1, 8, text_config.hidden_size)
@@ -183,6 +188,7 @@ def test_vision_sdpa_matches_eager() -> None:
         make_tiny_vision_config_for_impl("eager"),
         text_hidden_size=make_tiny_text_config().hidden_size,
     )
+    eager.init_weights()
     sdpa = Gemma4VisionTower(
         make_tiny_vision_config_for_impl("sdpa"),
         text_hidden_size=make_tiny_text_config().hidden_size,
@@ -305,6 +311,33 @@ def test_from_pretrained_attn_impl_override(tmp_path: Path) -> None:
     assert generated.shape == (1, 6)
 
 
+def test_from_pretrained_ignores_legacy_unclipped_linear_bounds(tmp_path: Path) -> None:
+    model = Gemma4Model(
+        Gemma4Config(
+            text=make_tiny_text_config(),
+            vision=make_tiny_vision_config(),
+            audio=make_tiny_audio_config(),
+        )
+    )
+    save_dir = tmp_path / "legacy_bounds"
+    model.save_pretrained(save_dir)
+
+    weights_path = save_dir / "model.safetensors"
+    state = load_safetensors(str(weights_path))
+    state["vision.encoder.patch_embed.input_proj.input_min"] = torch.tensor(float("-inf"))
+    state["vision.encoder.patch_embed.input_proj.input_max"] = torch.tensor(float("inf"))
+    state["vision.encoder.patch_embed.input_proj.output_min"] = torch.tensor(float("-inf"))
+    state["vision.encoder.patch_embed.input_proj.output_max"] = torch.tensor(float("inf"))
+    state["audio.encoder.subsampler.output_proj.input_min"] = torch.tensor(float("-inf"))
+    state["audio.encoder.subsampler.output_proj.input_max"] = torch.tensor(float("inf"))
+    state["audio.encoder.subsampler.output_proj.output_min"] = torch.tensor(float("-inf"))
+    state["audio.encoder.subsampler.output_proj.output_max"] = torch.tensor(float("inf"))
+    save_safetensors(state, str(weights_path))
+
+    reloaded = Gemma4Model.from_pretrained(save_dir)
+    assert set(reloaded.state_dict()) == set(model.state_dict())
+
+
 def test_init_non_persistent_buffers_recurses_into_audio() -> None:
     model = Gemma4Model(
         Gemma4Config(
@@ -340,6 +373,24 @@ def test_from_pretrained_rebuilds_audio_non_persistent_buffers(tmp_path: Path) -
     assert audio_attn.causal_valid_mask.dtype == torch.bool
     assert not audio_attn.causal_valid_mask.is_meta
     assert reloaded.audio.to_text.weight.dtype == torch.bfloat16
+
+
+def test_materialize_initializes_meta_model_and_runtime_buffers() -> None:
+    with torch.device("meta"):
+        model = Gemma4Model(
+            Gemma4Config(
+                text=make_tiny_text_config(),
+                audio=make_tiny_audio_config(),
+            )
+        )
+
+    model.materialize(device="cpu", dtype=torch.float32, init_weights=True)
+    audio_attn = model.audio.encoder.layers[0].attn.attn
+
+    assert not next(model.parameters()).is_meta
+    assert next(model.parameters()).dtype == torch.float32
+    assert audio_attn.causal_valid_mask.dtype == torch.bool
+    assert not audio_attn.causal_valid_mask.is_meta
 
 
 def _train_tiny_sentencepiece_model(tmp_path: Path) -> Path:

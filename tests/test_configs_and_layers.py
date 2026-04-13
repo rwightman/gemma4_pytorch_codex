@@ -13,6 +13,7 @@ from gemma4_pt_codex import (
 )
 from gemma4_pt_codex.layers import (
     RMSNorm,
+    VisionRMSNorm,
     build_positions_from_mask,
     create_sliding_mask,
     make_causal_bidirectional_mask,
@@ -226,3 +227,8 @@ def test_rms_norm_without_scale_matches_manual_result() -> None:
 
     manual = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
     torch.testing.assert_close(out, manual)
+
+
+def test_vision_rms_norm_is_zero_init() -> None:
+    norm = VisionRMSNorm(8)
+    assert torch.equal(norm.weight, torch.zeros_like(norm.weight))
